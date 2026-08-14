@@ -1,0 +1,27 @@
+# Runtime configuration and state
+server/config.json
+server/state.json
+server/*-result.json
+
+# Generated SSH identities and host pinning files
+server/ssh-host-*
+server/agent-*-ed25519*
+server/known_hosts*
+**/known_hosts*
+**/id_rsa*
+**/id_ed25519*
+**/*.pem
+**/*.key
+
+# Secrets and local environment
+.env
+.env.*
+!.env.example
+
+# Dependencies, logs, and editor files
+server/node_modules/
+*.log
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store

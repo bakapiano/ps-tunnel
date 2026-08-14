@@ -1,0 +1,29 @@
+{
+  "agentListen": {
+    "host": "127.0.0.1",
+    "port": 8765
+  },
+  "controlListen": {
+    "host": "127.0.0.1",
+    "port": 8766
+  },
+  "controlToken": "replace-with-a-random-control-token-at-least-32-characters",
+  "agents": {
+    "agent-a": "replace-with-an-independent-agent-secret-at-least-32-characters"
+  },
+  "ssh": {
+    "host": "0.0.0.0",
+    "port": 2222,
+    "user": "agent-a",
+    "hostKeyFile": "ssh-host-ed25519",
+    "authorizedKeyFile": "agent-a-ed25519.pub",
+    "brokerHost": "127.0.0.1",
+    "brokerPort": 8765
+  },
+  "stateFile": "state.json",
+  "heartbeatSeconds": 15,
+  "sessionTimeoutSeconds": 45,
+  "maxMessageBytes": 262144,
+  "maxTaskTimeoutSeconds": 120,
+  "enableTestHooks": false
+}

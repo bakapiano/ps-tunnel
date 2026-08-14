@@ -1,0 +1,377 @@
+# PS Tunnel
+
+PS Tunnel 是一个用于**已授权 Windows 设备管理**的出站任务通道。受管端 A 只需要 PowerShell 5.1+ 和 Windows OpenSSH 客户端 `ssh.exe`；管理端 B 运行 Node.js 服务并监听 SSH 端口。
+
+A 主动连接 B，因此 A 无需监听端口，也无需安装 `sshd`。传输由 SSH 加密，SSH 公钥认证后，协议层再用独立 Agent Secret 完成 HMAC-SHA256 双向挑战应答。
+
+```text
+B: ctl.ps1 -> 127.0.0.1:8766 -> broker.js
+                                      ^
+                                      | loopback only
+A: client.ps1 -> SSH :2222 -> ssh-server.js
+```
+
+## 安全模型
+
+- SSH 入口只接受配置中的用户名和 Ed25519 公钥。
+- SSH 会话只能桥接到 B 本机回环地址上的 Broker。
+- TTY、环境变量、X11 和额外 SSH 会话请求会被拒绝。
+- Agent 使用独立 Secret 做 HMAC-SHA256 双向认证。
+- 控制 API 只绑定 `127.0.0.1`，并要求独立 Bearer Token。
+- A 使用 `StrictHostKeyChecking=yes` 固定校验 B 的 SSH host key。
+- 客户端采用带抖动的指数退避自动重连。
+- 任务执行采用固定白名单：`ping`、`echo`、`get_host_info`。
+
+该设计面向明确授权的设备。请按组织安全策略保存、分发和轮换密钥。
+
+## 目录
+
+```text
+client/
+  client.ps1          A 上运行的 PowerShell 5.1/7 客户端
+server/
+  broker.js           Agent 会话、任务队列和本地控制 API
+  ssh-server.js       基于 ssh2 的受限 SSH 监听器
+  session.js          协议 E2E 使用的本地进程桥
+  start.ps1           启动或检查 B 端进程
+  ctl.ps1             B 本机控制命令
+  config.example.json 配置模板
+  e2e.ps1             认证、任务和断线重连 E2E
+```
+
+运行时配置、私钥、公钥、`known_hosts`、状态、日志和 `node_modules` 均已加入 `.gitignore`。
+
+## 前置条件
+
+### A：受管 Windows 设备
+
+- Windows PowerShell 5.1 或 PowerShell 7
+- Windows OpenSSH 客户端
+
+检查：
+
+```powershell
+Get-Command powershell.exe, ssh.exe, ssh-keygen.exe
+```
+
+### B：管理端 Windows 设备
+
+- Node.js 18+
+- PowerShell 5.1 或 PowerShell 7
+- Windows OpenSSH 客户端，用于生成密钥
+- 管理员权限，仅用于创建入站防火墙规则
+
+检查：
+
+```powershell
+node --version
+Get-Command node.exe, ssh.exe, ssh-keygen.exe
+```
+
+## 部署 B
+
+以下命令在仓库根目录执行。
+
+### 1. 安装依赖
+
+```powershell
+Set-Location .\server
+npm ci --ignore-scripts --omit=dev --no-audit --no-fund
+Copy-Item .\config.example.json .\config.json
+```
+
+`ssh2` 可以使用纯 JavaScript 后备实现，因此受控环境中可使用 `--ignore-scripts` 跳过可选原生模块编译。
+
+### 2. 生成独立 Secret
+
+```powershell
+function New-RandomSecret {
+    $bytes = New-Object byte[] 32
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
+    [Convert]::ToBase64String($bytes)
+}
+
+$configPath = (Resolve-Path .\config.json).Path
+$config = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
+$config.controlToken = New-RandomSecret
+$config.agents.'agent-a' = New-RandomSecret
+$json = $config | ConvertTo-Json -Depth 10
+[System.IO.File]::WriteAllText(
+    $configPath,
+    $json,
+    (New-Object System.Text.UTF8Encoding($false))
+)
+```
+
+`controlToken` 只用于 B 本机控制 API；`agents.agent-a` 只用于 A 与 Broker 的应用层认证。两者应保持独立。
+
+### 3. 生成 SSH host key 和 Agent key
+
+首次部署分别执行下面两条命令：
+
+```powershell
+ssh-keygen.exe -t ed25519 -C 'ps-tunnel-host' -f .\ssh-host-ed25519
+ssh-keygen.exe -t ed25519 -C 'ps-tunnel-agent-a' -f .\agent-a-ed25519
+```
+
+两次命令都在 passphrase 提示处直接按 Enter。B 的监听器需要无人值守读取 host 私钥，A 的客户端需要无人值守断线重连。文件 ACL 和独立 Agent Secret 提供额外保护。
+
+收紧 B 上 host 私钥的 ACL：
+
+```powershell
+$me = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+$hostKey = (Resolve-Path .\ssh-host-ed25519).Path
+icacls.exe $hostKey /inheritance:r
+icacls.exe $hostKey /grant:r "${me}:(R)" 'SYSTEM:(R)'
+```
+
+### 4. 为 A 创建固定 host key 文件
+
+把 `<B_ADDRESS>` 替换为 A 实际连接 B 时使用的 IPv4 地址或 DNS 名称：
+
+```powershell
+$BAddress = '<B_ADDRESS>'
+$port = 2222
+$hostPublicKey = ((Get-Content .\ssh-host-ed25519.pub -Raw).Trim() -split '\s+')
+('[{0}]:{1} {2} {3}' -f $BAddress, $port, $hostPublicKey[0], $hostPublicKey[1]) |
+    Set-Content -LiteralPath .\known_hosts-a -Encoding ascii
+
+ssh-keygen.exe -lf .\known_hosts-a
+```
+
+自定义端口的 `known_hosts` 主机字段必须使用 `[host]:port` 格式。
+
+### 5. 启动 B
+
+```powershell
+.\start.ps1
+```
+
+脚本会启动或检查以下监听器：
+
+- `127.0.0.1:8765`：Agent Broker
+- `127.0.0.1:8766`：控制 API
+- `0.0.0.0:2222`：受限 SSH 入口
+
+启动日志写入 `server` 目录并由 Git 忽略。再次运行 `start.ps1` 会检查端口是否由预期进程占用。
+
+### 6. 创建 B 的防火墙规则
+
+在 B 的管理员 PowerShell 中执行：
+
+```powershell
+$ruleName = 'PS-Tunnel-SSH-In-TCP'
+if (-not (Get-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue)) {
+    New-NetFirewallRule `
+        -Name $ruleName `
+        -DisplayName 'PS Tunnel restricted SSH listener' `
+        -Enabled True `
+        -Direction Inbound `
+        -Action Allow `
+        -Protocol TCP `
+        -LocalPort 2222 `
+        -RemoteAddress LocalSubnet `
+        -Profile Domain,Private
+}
+```
+
+根据实际网络边界调整 `RemoteAddress` 和 Profile。Broker 的 8765、8766 继续只监听回环地址。
+
+## 部署 A
+
+### 1. 复制三个文件
+
+在 A 创建固定目录 `C:\ps_tunnel`，然后通过获批的文件传输方式复制：
+
+```text
+client/client.ps1        -> C:\ps_tunnel\client.ps1
+server/agent-a-ed25519   -> C:\ps_tunnel\agent-a-ed25519
+server/known_hosts-a     -> C:\ps_tunnel\known_hosts-a
+```
+
+Agent 公钥留在 B 的 `server/agent-a-ed25519.pub`，Agent 私钥放在 A。
+
+### 2. 收紧 A 上私钥 ACL
+
+```powershell
+$key = 'C:\ps_tunnel\agent-a-ed25519'
+$me = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+
+icacls.exe $key /inheritance:r
+icacls.exe $key /grant:r "${me}:(R)" 'SYSTEM:(R)'
+
+# 验证当前账户能够读取私钥，并显示它对应的公钥指纹
+ssh-keygen.exe -y -f $key | ssh-keygen.exe -lf -
+```
+
+### 3. 启动客户端
+
+通过安全渠道把 `config.json` 中 `agents.agent-a` 的值交给 A，然后执行：
+
+```powershell
+Set-Location 'C:\ps_tunnel'
+$env:PS_TUNNEL_AGENT_SECRET = '<AGENT_SECRET>'
+
+& 'C:\ps_tunnel\client.ps1' `
+    -AgentId 'agent-a' `
+    -SshHost '<B_ADDRESS>' `
+    -SshPort 2222 `
+    -SshUser 'agent-a' `
+    -SshPath "$env:WINDIR\System32\OpenSSH\ssh.exe" `
+    -IdentityFile 'C:\ps_tunnel\agent-a-ed25519' `
+    -KnownHostsFile 'C:\ps_tunnel\known_hosts-a' `
+    -LogPath "$HOME\ps-tunnel-client.log" `
+    -ReconnectInitialSeconds 1 `
+    -ReconnectMaxSeconds 30
+```
+
+看到 `Authenticated session ...` 表示 A 已在线。网络或 B 重启后，客户端会持续重连。
+
+首次在交互终端认证成功后，客户端会询问：
+
+```text
+Connection authenticated. Create a one-click start-client.ps1 with these settings? [y/N]
+```
+
+输入 `y` 会在 `client.ps1` 旁生成 `start-client.ps1`。生成器会保存本次全部有效连接、超时和重连参数；Agent Secret 使用 Windows DPAPI 的 .NET API 加密，因此启动脚本只可由创建它的同一台计算机、同一 Windows 用户解密。文件 ACL 会收紧到当前用户和 `SYSTEM`。
+
+以后可以一键运行：
+
+```powershell
+& 'C:\ps_tunnel\start-client.ps1'
+```
+
+启动脚本会传入 `LauncherMode=Never`，因此不会再次询问。自动化场景也可在原始命令中使用 `-LauncherMode Never`；需要直接生成时可使用 `-LauncherMode Always -LauncherPath <path.ps1>`。
+
+## 在 B 上提交任务
+
+从本机配置读取控制令牌：
+
+```powershell
+Set-Location '<REPOSITORY_ROOT>'
+$env:PS_TUNNEL_CONTROL_TOKEN =
+    (Get-Content .\server\config.json -Raw | ConvertFrom-Json).controlToken
+
+.\server\ctl.ps1 status
+.\server\ctl.ps1 submit -AgentId agent-a -TaskAction ping -Wait
+.\server\ctl.ps1 submit -AgentId agent-a -TaskAction echo `
+    -ArgumentsJson '{"text":"hello"}' -Wait
+.\server\ctl.ps1 submit -AgentId agent-a -TaskAction get_host_info -Wait
+```
+
+`get_host_info` 返回计算机名、当前用户、PowerShell 版本、进程 ID、工作目录和时间。
+
+## 踩坑与诊断
+
+### A 只有 `ssh.exe`
+
+这是预期部署形态。A 是出站 SSH 客户端，监听器位于 B。`Get-Service sshd` 在 A 上没有结果不会影响客户端运行。
+
+### 指定的私钥没有被 SSH 提交
+
+客户端固定传入：
+
+```text
+-o BatchMode=yes
+-o IdentitiesOnly=yes
+-i <identity-file>
+```
+
+`IdentitiesOnly=yes` 可以避免 SSH Agent、默认密钥和配置文件干扰显式指定的密钥。用下面的命令确认私钥可读：
+
+```powershell
+ssh-keygen.exe -y -f C:\ps_tunnel\agent-a-ed25519 | ssh-keygen.exe -lf -
+```
+
+### Windows OpenSSH 拒绝私钥权限
+
+典型现象是 `UNPROTECTED PRIVATE KEY FILE`、`Permissions ... are too open` 或私钥未被采用。移除继承 ACL，只授予运行客户端的账户和 `SYSTEM` 读取权限，然后再次执行 `ssh-keygen -y`。
+
+### `known_hosts` 看起来正确，但主机校验仍失败
+
+端口 2222 对应的行必须以 `[B_ADDRESS]:2222` 开头。确认 A 使用的地址与生成文件时完全一致，并检查指纹：
+
+```powershell
+ssh-keygen.exe -lf C:\ps_tunnel\known_hosts-a
+```
+
+主机密钥变化时，应先通过可信渠道核验 B 的新指纹，再替换固定记录。
+
+### 手工 SSH 已认证，随后收到协议错误
+
+直接运行 SSH 会先看到 Broker 发出的 `challenge`。向 SSH 管道写入 `{}` 会关闭标准输入，Broker 会返回 `Expected authenticate message`；这说明 SSH、公钥和 Broker 链路已经连通，但输入不是完整 HMAC 协议。正式客户端会保持标准输入开启并完成挑战应答。
+
+### 客户端显示 `Transport closed before authentication challenge`
+
+新版客户端会把 SSH 标准错误写入 `-LogPath`。常见检查顺序：
+
+```powershell
+Test-NetConnection '<B_ADDRESS>' -Port 2222
+Get-Content "$HOME\ps-tunnel-client.log" -Tail 100
+```
+
+然后使用详细 SSH 日志确认连接、公钥和 host key：
+
+```powershell
+ssh.exe -vvv -T -p 2222 `
+    -l agent-a `
+    -i C:\ps_tunnel\agent-a-ed25519 `
+    -o IdentitiesOnly=yes `
+    -o BatchMode=yes `
+    -o StrictHostKeyChecking=yes `
+    -o 'UserKnownHostsFile=C:\ps_tunnel\known_hosts-a' `
+    '<B_ADDRESS>'
+```
+
+成功链路会依次出现 `Connection established`、host key 匹配、`Offering public key`、`Authenticated` 和 JSON challenge。按 Ctrl+C 结束手工诊断。
+
+### PowerShell 5.1 的 UTF-8 BOM
+
+Windows PowerShell 5.1 的 `Set-Content -Encoding UTF8` 会写入 BOM。配置生成示例使用 `.NET UTF8Encoding(false)` 写入；服务端读取配置时也会兼容 BOM。
+
+由 PowerShell 7 启动 Windows PowerShell 5.1 时，继承的 `PSModulePath` 可能影响内置模块自动加载。一键脚本生成直接调用 Windows DPAPI 的 .NET API，因此不依赖 `Microsoft.PowerShell.Security` 模块。
+
+### 路径中包含空格
+
+客户端和 `start.ps1` 都会为原生命令正确引用参数。固定部署到简短目录仍更便于人工排障，例如 `C:\ps_tunnel`。
+
+### 端口已被占用
+
+```powershell
+Get-NetTCPConnection -State Listen -LocalPort 2222,8765,8766 |
+    Select-Object LocalAddress,LocalPort,OwningProcess
+```
+
+`start.ps1` 会校验监听端口的进程命令行，避免把未知监听器误认为 PS Tunnel。
+
+## 扩展任务白名单
+
+增加一个动作时，需要同步更新：
+
+1. `client/client.ps1` 中的 `$AllowedTaskScript`。
+2. `server/broker.js` 中的 `ALLOWED_ACTIONS`。
+3. `server/ctl.ps1` 中 `TaskAction` 的 `ValidateSet`。
+4. `server/e2e.ps1` 中相应的正常、异常和超时测试。
+
+动作应使用结构化参数和结构化结果，并设置输入长度、执行时间和输出大小上限。
+
+## 测试
+
+在仓库根目录执行：
+
+```powershell
+pwsh -NoProfile -File .\server\e2e.ps1 `
+    -ClientPowerShellPath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+```
+
+测试覆盖 HMAC 认证、DPAPI 启动脚本生成与实际执行、明文 Secret 泄漏检查、`echo`、主机信息、强制断线、自动重连和重连后任务。生产部署还应从 A 执行一次 `Test-NetConnection` 和详细 SSH 握手检查。
+
+## 密钥轮换
+
+- 轮换 Agent SSH key：在 B 更新 `authorizedKeyFile` 指向的公钥，在 A 更新对应私钥。
+- 轮换 Agent Secret：在 B 更新 `agents.<agent-id>`，随后更新 A 的环境变量并重启客户端。
+- 轮换控制令牌：在 B 更新 `controlToken`，随后更新运行 `ctl.ps1` 的环境变量。
+- 轮换 B host key：先通过可信渠道分发新指纹和 `known_hosts`，再重启 SSH 监听器。
+
+每台 A 建议使用独立 Agent ID、SSH key 和 Agent Secret，以便单独撤销和审计。

@@ -1,0 +1,13 @@
+{
+  "name": "ps-tunnel-server",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Restricted SSH transport for the PS Tunnel broker",
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ssh2": "1.17.0"
+  }
+}
