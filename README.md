@@ -5,10 +5,13 @@ PS Tunnel 是一个用于**已授权 Windows 设备管理**的出站任务通道
 A 主动连接 B，因此 A 无需监听端口，也无需安装 `sshd`。传输由 SSH 加密，SSH 公钥认证后，协议层再用独立 Agent Secret 完成 HMAC-SHA256 双向挑战应答。
 
 ```text
-B: ctl.ps1 -> 127.0.0.1:8766 -> broker.js
-                                      ^
-                                      | loopback only
-A: client.ps1 -> SSH :2222 -> ssh-server.js
+Codex / Claude Code / GitHub Copilot
+                  -> MCP stdio -> mcp-server.mjs
+                                      |
+B: ctl.ps1 ---------------------------+-> 127.0.0.1:8766 -> broker.js
+                                                               ^
+                                                               | loopback only
+A: client.ps1 -------------------------> SSH :2222 -> ssh-server.js
 ```
 
 ## 安全模型
@@ -18,6 +21,7 @@ A: client.ps1 -> SSH :2222 -> ssh-server.js
 - TTY、环境变量、X11 和额外 SSH 会话请求会被拒绝。
 - Agent 使用独立 Secret 做 HMAC-SHA256 双向认证。
 - 控制 API 只绑定 `127.0.0.1`，并要求独立 Bearer Token。
+- MCP server 由 AI 客户端通过 stdio 启动，并使用环境变量中的控制令牌访问回环控制 API。
 - A 使用 `StrictHostKeyChecking=yes` 固定校验 B 的 SSH host key。
 - 客户端采用带抖动的指数退避自动重连。
 - 任务动作包括 `ping`、`echo`、`get_host_info` 和可执行任意脚本内容的 `powershell`。
@@ -27,16 +31,22 @@ A: client.ps1 -> SSH :2222 -> ssh-server.js
 ## 目录
 
 ```text
+mcp-config/
+  codex.config.toml             Codex 用户配置示例
+  claude.mcp.json               Claude Code 项目配置示例
+  github-copilot.mcp.json       GitHub Copilot / VS Code 配置示例
 client/
   client.ps1          A 上运行的 PowerShell 5.1/7 客户端
 server/
   broker.js           Agent 会话、任务队列和本地控制 API
+  mcp-server.mjs      标准 stdio MCP server
+  mcp-smoke.mjs       官方 MCP SDK client 全链路测试
   ssh-server.js       基于 ssh2 的受限 SSH 监听器
   session.js          协议 E2E 使用的本地进程桥
   start.ps1           启动或检查 B 端进程
   ctl.ps1             B 本机控制命令
   config.example.json 配置模板
-  e2e.ps1             认证、任务和断线重连 E2E
+  e2e.ps1             认证、MCP、任务和断线重连 E2E
 ```
 
 运行时配置、私钥、公钥、`known_hosts`、状态、日志和 `node_modules` 均已加入 `.gitignore`。
@@ -56,7 +66,7 @@ Get-Command powershell.exe, ssh.exe, ssh-keygen.exe
 
 ### B：管理端 Windows 设备
 
-- Node.js 18+
+- Node.js 20+
 - PowerShell 5.1 或 PowerShell 7
 - Windows OpenSSH 客户端，用于生成密钥
 - 管理员权限，仅用于创建入站防火墙规则
@@ -274,6 +284,61 @@ $services = Get-Service | Where-Object Status -eq 'Running'
 `get_host_info` 返回计算机名、当前用户、PowerShell 版本、进程 ID、工作目录和时间。
 `powershell` 在客户端的新 PowerShell runspace 中执行 `args.script`，并把管道输出作为任务结果返回；也可以通过 `-ArgumentsJson '{"script":"Get-Date"}'` 提交。
 
+## 通过 MCP 使用
+
+项目提供标准 stdio MCP server，并注册四个 tools：
+
+- `list_agents`：列出 Agent 和连接状态。
+- `run_powershell`：提交 PowerShell 并等待完整结果。
+- `submit_powershell`：提交 PowerShell 并立即返回 task ID。
+- `get_task`：按 task ID 查询状态和完整结果。
+
+先在启动 AI 客户端的终端中设置控制令牌；MCP server 默认访问 `http://127.0.0.1:8766`：
+
+```powershell
+Set-Location '<REPOSITORY_ROOT>'
+$env:PS_TUNNEL_CONTROL_TOKEN =
+    (Get-Content .\server\config.json -Raw | ConvertFrom-Json).controlToken
+```
+
+需要连接另一控制地址时设置：
+
+```powershell
+$env:PS_TUNNEL_CONTROL_BASE_URI = 'http://127.0.0.1:8766'
+```
+
+### Codex
+
+将 `mcp-config/codex.config.toml` 中的路径替换为仓库绝对路径，再把配置段合并到用户级 `$HOME/.codex/config.toml`：
+
+```powershell
+codex mcp list
+codex
+```
+
+新会话中可以直接要求模型：
+
+```text
+使用 ps_tunnel MCP，先列出 Agent，再在 agent-a 执行：Get-Date
+```
+
+Codex CLI、IDE 扩展和桌面端共用 MCP 配置，具体配置项见 [OpenAI Docs](https://learn.chatgpt.com/docs/extend/mcp?surface=cli)。
+
+### Claude Code
+
+把 `mcp-config/claude.mcp.json` 的内容合并到需要启用 MCP 的项目级 `.mcp.json`：
+
+```powershell
+claude mcp list
+claude
+```
+
+### GitHub Copilot
+
+把 `mcp-config/github-copilot.mcp.json` 的内容合并到需要启用 MCP 的工作区级 `.vscode/mcp.json`。打开该工作区后，在 Copilot Chat 的工具列表中启用 `ps_tunnel` tools，即可从 Agent 模式调用。
+
+这三份文件位于纯示例目录，当前仓库不会自动加载 MCP 配置。测试流程通过一次性命令行配置启动 Codex，并把 MCP 与 Codex 的工作目录放入系统临时目录。
+
 ## 踩坑与诊断
 
 ### A 只有 `ssh.exe`
@@ -370,14 +435,26 @@ Get-NetTCPConnection -State Listen -LocalPort 2222,8765,8766 |
 
 ## 测试
 
-在仓库根目录执行：
+测试需要完整依赖。在仓库根目录执行：
 
 ```powershell
+Set-Location .\server
+npm ci --ignore-scripts --no-audit --no-fund
+Set-Location ..
+
 pwsh -NoProfile -File .\server\e2e.ps1 `
     -ClientPowerShellPath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
 ```
 
-测试覆盖 HMAC 认证、DPAPI 启动脚本生成与实际执行、明文 Secret 泄漏检查、任意 PowerShell、`echo`、主机信息、强制断线、自动重连和重连后任务。生产部署还应从 A 执行一次 `Test-NetConnection` 和详细 SSH 握手检查。
+以上测试会通过官方 MCP client SDK 完成 `initialize`、`tools/list` 和四个 tools 的调用。加入 `-CodexMcp` 会再启动本机 Codex 临时会话，让模型实际调用 `list_agents` 和 `run_powershell`，并在 Broker 状态与模型最终回复中核对唯一 marker：
+
+```powershell
+pwsh -NoProfile -File .\server\e2e.ps1 -CodexMcp
+```
+
+E2E 会在 `%TEMP%/ps-tunnel-e2e-*` 下创建独立的 Broker 状态、MCP 工作区和 Codex 工作区。Codex 使用 `--ephemeral` 与一次性 `-c` 配置，测试成功后自动删除整个临时目录，当前仓库的 Codex resume 状态保持独立。
+
+完整测试覆盖 HMAC 认证、DPAPI 启动脚本生成与实际执行、Secret 检查、任意 PowerShell、MCP SDK、Codex 模型调用、`echo`、主机信息、强制断线、自动重连和重连后任务。生产部署还应从 A 执行一次 `Test-NetConnection` 和详细 SSH 握手检查。
 
 ## 密钥轮换
 

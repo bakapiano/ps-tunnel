@@ -341,6 +341,7 @@ const agentServer = net.createServer((socket) => {
     connectedAt: null,
     lastSeen: Date.now(),
     buffer: '',
+    receivedProtocolLine: false,
     authTimer: null,
   };
 
@@ -365,8 +366,12 @@ const agentServer = net.createServer((socket) => {
 
     let newlineIndex;
     while ((newlineIndex = session.buffer.indexOf('\n')) >= 0) {
-      const line = session.buffer.slice(0, newlineIndex).replace(/\r$/, '');
+      let line = session.buffer.slice(0, newlineIndex).replace(/\r$/, '');
       session.buffer = session.buffer.slice(newlineIndex + 1);
+      if (!session.receivedProtocolLine) {
+        line = line.replace(/^\uFEFF/, '');
+        session.receivedProtocolLine = true;
+      }
       if (Buffer.byteLength(line, 'utf8') > config.maxMessageBytes) {
         closeForProtocolError(session, new Error('Protocol message exceeds maxMessageBytes.'));
         return;

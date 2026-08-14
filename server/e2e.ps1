@@ -1,6 +1,8 @@
 [CmdletBinding()]
 param(
-    [string]$ClientPowerShellPath
+    [string]$ClientPowerShellPath,
+    [switch]$CodexMcp,
+    [string]$CodexPath = 'codex'
 )
 
 Set-StrictMode -Version 2.0
@@ -42,7 +44,18 @@ $clientPath = Join-Path $rootDirectory 'client\client.ps1'
 $brokerPath = Join-Path $serverDirectory 'broker.js'
 $sessionPath = Join-Path $serverDirectory 'session.js'
 $controlPath = Join-Path $serverDirectory 'ctl.ps1'
+$mcpServerPath = Join-Path $serverDirectory 'mcp-server.mjs'
+$mcpSmokePath = Join-Path $serverDirectory 'mcp-smoke.mjs'
 $nodePath = (Get-Command node -ErrorAction Stop).Source
+$codexExecutable = $null
+if ($CodexMcp) {
+    if (Test-Path -LiteralPath $CodexPath -PathType Leaf) {
+        $codexExecutable = (Resolve-Path -LiteralPath $CodexPath).Path
+    }
+    else {
+        $codexExecutable = (Get-Command $CodexPath -ErrorAction Stop).Source
+    }
+}
 if ([string]::IsNullOrWhiteSpace($ClientPowerShellPath)) {
     $clientPowerShellExecutable = (Get-Command pwsh -ErrorAction Stop).Source
 }
@@ -59,6 +72,10 @@ if (-not $tempDirectory.StartsWith($tempBase, [System.StringComparison]::Ordinal
     throw 'Temporary test path escaped the system temporary directory.'
 }
 [void](New-Item -ItemType Directory -Path $tempDirectory)
+$mcpWorkspace = Join-Path $tempDirectory 'mcp-workspace'
+$codexWorkspace = Join-Path $tempDirectory 'codex-workspace'
+[void](New-Item -ItemType Directory -Path $mcpWorkspace)
+[void](New-Item -ItemType Directory -Path $codexWorkspace)
 
 $agentPort = Get-FreeTcpPort
 do {
@@ -76,6 +93,9 @@ $clientLog = Join-Path $tempDirectory 'client.audit.log'
 $launcherPath = Join-Path $tempDirectory 'start-client.ps1'
 $launcherStdout = Join-Path $tempDirectory 'launcher.stdout.log'
 $launcherStderr = Join-Path $tempDirectory 'launcher.stderr.log'
+$codexStdout = Join-Path $tempDirectory 'codex.stdout.jsonl'
+$codexStderr = Join-Path $tempDirectory 'codex.stderr.log'
+$codexLastMessage = Join-Path $tempDirectory 'codex.last-message.txt'
 $baseUri = 'http://127.0.0.1:{0}' -f $controlPort
 $headers = @{ Authorization = 'Bearer {0}' -f $controlToken }
 
@@ -147,6 +167,8 @@ $brokerProcess = $null
 $clientProcess = $null
 $launcherProcess = $null
 $originalAgentSecret = $env:PS_TUNNEL_AGENT_SECRET
+$originalControlToken = $env:PS_TUNNEL_CONTROL_TOKEN
+$originalControlBaseUri = $env:PS_TUNNEL_CONTROL_BASE_URI
 $testSucceeded = $false
 try {
     $brokerProcess = Start-Process -FilePath $nodePath -ArgumentList @($brokerPath, '--config', $configPath) `
@@ -248,6 +270,99 @@ try {
     Assert-True ([int]$powerShellResult.result.output.total -eq 10) 'powershell task should execute variables and pipelines'
     Assert-True (-not [string]::IsNullOrWhiteSpace([string]$powerShellResult.result.output.runtime)) 'powershell task should expose its runtime version'
 
+    $env:PS_TUNNEL_CONTROL_TOKEN = $controlToken
+    $env:PS_TUNNEL_CONTROL_BASE_URI = $baseUri
+    $mcpMarker = 'mcp-{0}' -f [Guid]::NewGuid().ToString('N')
+    $mcpOutput = @(& $nodePath $mcpSmokePath `
+        --server $mcpServerPath `
+        --agent 'agent-a' `
+        --marker $mcpMarker `
+        --cwd $mcpWorkspace)
+    if ($LASTEXITCODE -ne 0) {
+        throw ('MCP smoke process exited with code {0}.' -f $LASTEXITCODE)
+    }
+    $mcpResult = ($mcpOutput -join "`n") | ConvertFrom-Json
+    Assert-True ($mcpResult.ok -eq $true) 'MCP SDK client smoke test should succeed'
+    Assert-True ($mcpResult.marker -eq $mcpMarker) 'MCP run_powershell should preserve its marker'
+    Assert-True (@($mcpResult.tools).Count -eq 4) 'MCP tools/list should return all four tools'
+    Assert-True (-not [string]::IsNullOrWhiteSpace([string]$mcpResult.runTaskId)) 'MCP run_powershell should return a task id'
+    Assert-True (-not [string]::IsNullOrWhiteSpace([string]$mcpResult.submittedTaskId)) 'MCP submit_powershell should return a task id'
+
+    if ($CodexMcp) {
+        $codexMarker = 'codex-{0}' -f [Guid]::NewGuid().ToString('N')
+        $codexExpectedValue = 3973
+        $codexPowerShell = "[pscustomobject]@{ marker = '$codexMarker'; value = (137 * 29); source = 'codex-mcp' }"
+        $codexPrompt = @"
+Use the ps_tunnel MCP server for this task. Call list_agents first and select agent-a. Then call run_powershell with agentId agent-a, timeoutSeconds 10, waitTimeoutSeconds 20, and this exact script:
+$codexPowerShell
+
+Use the MCP tools for execution. After the tool succeeds, reply with one compact JSON object containing marker, value, source, and taskId from the MCP result.
+"@
+        $nodeTomlString = ConvertTo-Json -InputObject $nodePath -Compress
+        $mcpServerTomlString = ConvertTo-Json -InputObject $mcpServerPath -Compress
+        $codexWorkspaceTomlString = ConvertTo-Json -InputObject $codexWorkspace -Compress
+        $codexArguments = @(
+            'exec',
+            '--json',
+            '--ephemeral',
+            '--skip-git-repo-check',
+            '--color', 'never',
+            '--sandbox', 'read-only',
+            '--output-last-message', $codexLastMessage,
+            '-C', $codexWorkspace,
+            '-c', ('mcp_servers.ps_tunnel.command={0}' -f $nodeTomlString),
+            '-c', ('mcp_servers.ps_tunnel.args=[{0}]' -f $mcpServerTomlString),
+            '-c', ('mcp_servers.ps_tunnel.cwd={0}' -f $codexWorkspaceTomlString),
+            '-c', 'mcp_servers.ps_tunnel.env_vars=["PS_TUNNEL_CONTROL_TOKEN","PS_TUNNEL_CONTROL_BASE_URI"]',
+            '-c', 'mcp_servers.ps_tunnel.startup_timeout_sec=10',
+            '-c', 'mcp_servers.ps_tunnel.tool_timeout_sec=120',
+            '-c', 'mcp_servers.ps_tunnel.default_tools_approval_mode="approve"',
+            '-c', 'mcp_servers.ps_tunnel.required=true',
+            $codexPrompt
+        )
+        $codexOutput = @(& $codexExecutable @codexArguments 2> $codexStderr)
+        $codexExitCode = $LASTEXITCODE
+        $codexOutput | Set-Content -LiteralPath $codexStdout -Encoding UTF8
+        if ($codexExitCode -ne 0) {
+            throw ('Codex MCP invocation exited with code {0}.' -f $codexExitCode)
+        }
+
+        $codexEvents = @($codexOutput | ForEach-Object { $_ | ConvertFrom-Json })
+        $codexMcpCalls = @($codexEvents | Where-Object {
+            $_.type -eq 'item.completed' -and
+            $null -ne $_.item -and
+            $_.item.type -eq 'mcp_tool_call'
+        })
+        $codexListAgentsCalls = @($codexMcpCalls | Where-Object {
+            (($_.item | ConvertTo-Json -Compress -Depth 20) -match 'ps_tunnel') -and
+            (($_.item | ConvertTo-Json -Compress -Depth 20) -match 'list_agents')
+        })
+        $codexRunPowerShellCalls = @($codexMcpCalls | Where-Object {
+            (($_.item | ConvertTo-Json -Compress -Depth 20) -match 'ps_tunnel') -and
+            (($_.item | ConvertTo-Json -Compress -Depth 20) -match 'run_powershell')
+        })
+        Assert-True ($codexListAgentsCalls.Count -gt 0) 'Codex JSON events should contain a completed ps_tunnel list_agents MCP tool call'
+        Assert-True ($codexRunPowerShellCalls.Count -gt 0) 'Codex JSON events should contain a completed ps_tunnel run_powershell MCP tool call'
+
+        $codexTask = Wait-Until -Description 'Codex-created MCP task' -TimeoutSeconds 20 -Condition {
+            $savedState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
+            $matchingTasks = @($savedState.tasks.PSObject.Properties | ForEach-Object { $_.Value } | Where-Object {
+                $_.action -eq 'powershell' -and [string]$_.args.script -match [regex]::Escape($codexMarker)
+            })
+            $completedTask = @($matchingTasks | Where-Object { $_.status -eq 'succeeded' }) | Select-Object -Last 1
+            if ($null -ne $completedTask) { return $completedTask }
+            return $false
+        }
+        Assert-True ($codexTask.result.output.marker -eq $codexMarker) 'Codex MCP task should return its unique marker'
+        Assert-True ([int]$codexTask.result.output.value -eq $codexExpectedValue) 'Codex MCP task should execute the requested arithmetic'
+        Assert-True ($codexTask.result.output.source -eq 'codex-mcp') 'Codex MCP task should return its source label'
+
+        $codexFinal = Get-Content -LiteralPath $codexLastMessage -Raw
+        Assert-True ($codexFinal -match [regex]::Escape($codexMarker)) 'Codex final response should include the MCP result marker'
+        Assert-True ($codexFinal -match [string]$codexExpectedValue) 'Codex final response should include the MCP result value'
+        Write-Host ('CODEX MCP PASS: model called run_powershell, task {0}, marker {1}.' -f $codexTask.id, $codexMarker)
+    }
+
     [void](Invoke-TestApi -Method POST -Path '/v1/test/disconnect' -Body @{ agentId = 'agent-a' })
     $secondStatus = Wait-Until -Description 'reconnected agent session' -TimeoutSeconds 20 -Condition {
         $status = Invoke-TestApi -Method GET -Path '/v1/status' -Body $null
@@ -294,10 +409,23 @@ try {
     Assert-True ($launcherResult.result.output.message -eq 'pong') 'generated launcher should return pong'
 
     $testSucceeded = $true
-    Write-Host ('E2E PASS: auth, protected launcher execution, arbitrary PowerShell, echo, host info, forced disconnect, and reconnect. Session {0} -> {1} -> {2}' -f $firstSessionId, $secondStatus.sessionId, $launcherStatus.sessionId)
+    $codexCoverage = if ($CodexMcp) { ', Codex model MCP invocation' } else { '' }
+    Write-Host ('E2E PASS: auth, protected launcher execution, arbitrary PowerShell, MCP SDK tools{0}, echo, host info, forced disconnect, and reconnect. Session {1} -> {2} -> {3}' -f $codexCoverage, $firstSessionId, $secondStatus.sessionId, $launcherStatus.sessionId)
 }
 finally {
     $env:PS_TUNNEL_AGENT_SECRET = $originalAgentSecret
+    if ($null -eq $originalControlToken) {
+        Remove-Item Env:PS_TUNNEL_CONTROL_TOKEN -ErrorAction SilentlyContinue
+    }
+    else {
+        $env:PS_TUNNEL_CONTROL_TOKEN = $originalControlToken
+    }
+    if ($null -eq $originalControlBaseUri) {
+        Remove-Item Env:PS_TUNNEL_CONTROL_BASE_URI -ErrorAction SilentlyContinue
+    }
+    else {
+        $env:PS_TUNNEL_CONTROL_BASE_URI = $originalControlBaseUri
+    }
     foreach ($process in @($launcherProcess, $clientProcess, $brokerProcess)) {
         if ($null -ne $process) {
             try {
@@ -315,7 +443,7 @@ finally {
 
     if (-not $testSucceeded) {
         Write-Host ('E2E artifacts retained at {0}' -f $tempDirectory)
-        foreach ($logFile in @($brokerStderr, $clientStdout, $clientStderr, $launcherStdout, $launcherStderr, $clientLog)) {
+        foreach ($logFile in @($brokerStderr, $clientStdout, $clientStderr, $launcherStdout, $launcherStderr, $clientLog, $codexStdout, $codexStderr, $codexLastMessage)) {
             if (Test-Path -LiteralPath $logFile) {
                 Write-Host ('--- {0} ---' -f $logFile)
                 Get-Content -LiteralPath $logFile -ErrorAction SilentlyContinue

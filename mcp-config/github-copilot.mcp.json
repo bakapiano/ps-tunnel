@@ -1,0 +1,15 @@
+{
+  "servers": {
+    "ps_tunnel": {
+      "type": "stdio",
+      "command": "node",
+      "args": [
+        "${workspaceFolder}/server/mcp-server.mjs"
+      ],
+      "env": {
+        "PS_TUNNEL_CONTROL_TOKEN": "${env:PS_TUNNEL_CONTROL_TOKEN}",
+        "PS_TUNNEL_CONTROL_BASE_URI": "${env:PS_TUNNEL_CONTROL_BASE_URI}"
+      }
+    }
+  }
+}
