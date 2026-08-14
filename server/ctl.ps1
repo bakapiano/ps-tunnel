@@ -5,9 +5,10 @@ param(
     [string]$Command = 'status',
 
     [string]$AgentId,
-    [ValidateSet('ping', 'echo', 'get_host_info')]
+    [ValidateSet('ping', 'echo', 'get_host_info', 'powershell')]
     [string]$TaskAction,
     [string]$ArgumentsJson = '{}',
+    [string]$PowerShellScript,
     [ValidateRange(1, 3600)]
     [int]$TaskTimeoutSeconds = 30,
     [string]$TaskId,
@@ -59,11 +60,22 @@ switch ($Command) {
         if ([string]::IsNullOrWhiteSpace($AgentId) -or [string]::IsNullOrWhiteSpace($TaskAction)) {
             throw 'submit requires AgentId and TaskAction.'
         }
-        try {
-            $taskArguments = $ArgumentsJson | ConvertFrom-Json
+        if ($PSBoundParameters.ContainsKey('PowerShellScript')) {
+            if ($TaskAction -ne 'powershell') {
+                throw 'PowerShellScript requires TaskAction powershell.'
+            }
+            if ($PSBoundParameters.ContainsKey('ArgumentsJson')) {
+                throw 'Use either PowerShellScript or ArgumentsJson for a powershell task.'
+            }
+            $taskArguments = [ordered]@{ script = $PowerShellScript }
         }
-        catch {
-            throw ('ArgumentsJson is invalid: {0}' -f $_.Exception.Message)
+        else {
+            try {
+                $taskArguments = $ArgumentsJson | ConvertFrom-Json
+            }
+            catch {
+                throw ('ArgumentsJson is invalid: {0}' -f $_.Exception.Message)
+            }
         }
         $created = Invoke-ControlRequest -Method POST -Path '/v1/tasks' -Body ([ordered]@{
             agentId = $AgentId

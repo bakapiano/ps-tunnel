@@ -20,7 +20,7 @@ A: client.ps1 -> SSH :2222 -> ssh-server.js
 - 控制 API 只绑定 `127.0.0.1`，并要求独立 Bearer Token。
 - A 使用 `StrictHostKeyChecking=yes` 固定校验 B 的 SSH host key。
 - 客户端采用带抖动的指数退避自动重连。
-- 任务执行采用固定白名单：`ping`、`echo`、`get_host_info`。
+- 任务动作包括 `ping`、`echo`、`get_host_info` 和可执行任意脚本内容的 `powershell`。
 
 该设计面向明确授权的设备。请按组织安全策略保存、分发和轮换密钥。
 
@@ -258,9 +258,21 @@ $env:PS_TUNNEL_CONTROL_TOKEN =
 .\server\ctl.ps1 submit -AgentId agent-a -TaskAction echo `
     -ArgumentsJson '{"text":"hello"}' -Wait
 .\server\ctl.ps1 submit -AgentId agent-a -TaskAction get_host_info -Wait
+
+$script = @'
+$services = Get-Service | Where-Object Status -eq 'Running'
+[pscustomobject]@{
+    computerName = $env:COMPUTERNAME
+    runningServiceCount = @($services).Count
+    topFive = @($services | Select-Object -First 5 -ExpandProperty Name)
+}
+'@
+.\server\ctl.ps1 submit -AgentId agent-a -TaskAction powershell `
+    -PowerShellScript $script -TaskTimeoutSeconds 30 -Wait
 ```
 
 `get_host_info` 返回计算机名、当前用户、PowerShell 版本、进程 ID、工作目录和时间。
+`powershell` 在客户端的新 PowerShell runspace 中执行 `args.script`，并把管道输出作为任务结果返回；也可以通过 `-ArgumentsJson '{"script":"Get-Date"}'` 提交。
 
 ## 踩坑与诊断
 
@@ -345,7 +357,7 @@ Get-NetTCPConnection -State Listen -LocalPort 2222,8765,8766 |
 
 `start.ps1` 会校验监听端口的进程命令行，避免把未知监听器误认为 PS Tunnel。
 
-## 扩展任务白名单
+## 扩展任务动作
 
 增加一个动作时，需要同步更新：
 
@@ -354,7 +366,7 @@ Get-NetTCPConnection -State Listen -LocalPort 2222,8765,8766 |
 3. `server/ctl.ps1` 中 `TaskAction` 的 `ValidateSet`。
 4. `server/e2e.ps1` 中相应的正常、异常和超时测试。
 
-动作应使用结构化参数和结构化结果，并设置输入长度、执行时间和输出大小上限。
+`powershell` 动作可直接承载任意 PowerShell 脚本。新增专用动作时，应使用结构化参数和结构化结果，并设置输入长度、执行时间和输出大小上限。
 
 ## 测试
 
@@ -365,7 +377,7 @@ pwsh -NoProfile -File .\server\e2e.ps1 `
     -ClientPowerShellPath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
 ```
 
-测试覆盖 HMAC 认证、DPAPI 启动脚本生成与实际执行、明文 Secret 泄漏检查、`echo`、主机信息、强制断线、自动重连和重连后任务。生产部署还应从 A 执行一次 `Test-NetConnection` 和详细 SSH 握手检查。
+测试覆盖 HMAC 认证、DPAPI 启动脚本生成与实际执行、明文 Secret 泄漏检查、任意 PowerShell、`echo`、主机信息、强制断线、自动重连和重连后任务。生产部署还应从 A 执行一次 `Test-NetConnection` 和详细 SSH 握手检查。
 
 ## 密钥轮换
 

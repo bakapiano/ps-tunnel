@@ -224,6 +224,30 @@ try {
     Assert-True ($hostResult.status -eq 'succeeded') 'get_host_info task should succeed'
     Assert-True (-not [string]::IsNullOrWhiteSpace([string]$hostResult.result.output.powerShellVersion)) 'host info should include PowerShell version'
 
+    $powerShellMarker = 'powershell-{0}' -f [Guid]::NewGuid().ToString('N')
+    $powerShellScript = @"
+`$numbers = 1..4
+[pscustomobject]@{
+    marker = '$powerShellMarker'
+    total = (`$numbers | Measure-Object -Sum).Sum
+    runtime = `$PSVersionTable.PSVersion.ToString()
+}
+"@
+    $powerShellResultJson = & $controlPath submit `
+        -BaseUri $baseUri `
+        -ControlToken $controlToken `
+        -AgentId 'agent-a' `
+        -TaskAction powershell `
+        -PowerShellScript $powerShellScript `
+        -TaskTimeoutSeconds 10 `
+        -Wait `
+        -WaitTimeoutSeconds 15
+    $powerShellResult = $powerShellResultJson | ConvertFrom-Json
+    Assert-True ($powerShellResult.status -eq 'succeeded') 'powershell task should succeed'
+    Assert-True ($powerShellResult.result.output.marker -eq $powerShellMarker) 'powershell task should return arbitrary script output'
+    Assert-True ([int]$powerShellResult.result.output.total -eq 10) 'powershell task should execute variables and pipelines'
+    Assert-True (-not [string]::IsNullOrWhiteSpace([string]$powerShellResult.result.output.runtime)) 'powershell task should expose its runtime version'
+
     [void](Invoke-TestApi -Method POST -Path '/v1/test/disconnect' -Body @{ agentId = 'agent-a' })
     $secondStatus = Wait-Until -Description 'reconnected agent session' -TimeoutSeconds 20 -Condition {
         $status = Invoke-TestApi -Method GET -Path '/v1/status' -Body $null
@@ -270,7 +294,7 @@ try {
     Assert-True ($launcherResult.result.output.message -eq 'pong') 'generated launcher should return pong'
 
     $testSucceeded = $true
-    Write-Host ('E2E PASS: auth, protected launcher execution, echo, host info, forced disconnect, and reconnect. Session {0} -> {1} -> {2}' -f $firstSessionId, $secondStatus.sessionId, $launcherStatus.sessionId)
+    Write-Host ('E2E PASS: auth, protected launcher execution, arbitrary PowerShell, echo, host info, forced disconnect, and reconnect. Session {0} -> {1} -> {2}' -f $firstSessionId, $secondStatus.sessionId, $launcherStatus.sessionId)
 }
 finally {
     $env:PS_TUNNEL_AGENT_SECRET = $originalAgentSecret

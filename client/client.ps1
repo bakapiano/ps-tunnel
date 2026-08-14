@@ -407,6 +407,18 @@ $AllowedTaskScript = {
             }
             break
         }
+        'powershell' {
+            if (-not $Arguments.ContainsKey('script')) {
+                throw 'powershell requires the script argument.'
+            }
+            if ($Arguments['script'] -isnot [string]) {
+                throw 'powershell script must be a string.'
+            }
+
+            $scriptBlock = [scriptblock]::Create([string]$Arguments['script'])
+            & $scriptBlock
+            break
+        }
         default {
             throw ('Action is outside the allowlist: {0}' -f $Action)
         }

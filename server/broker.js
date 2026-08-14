@@ -7,7 +7,7 @@ const net = require('net');
 const path = require('path');
 
 const PROTOCOL_VERSION = 1;
-const ALLOWED_ACTIONS = new Set(['ping', 'echo', 'get_host_info']);
+const ALLOWED_ACTIONS = new Set(['ping', 'echo', 'get_host_info', 'powershell']);
 
 function parseArguments(argv) {
   const result = {};
@@ -499,6 +499,10 @@ const controlServer = http.createServer(async (request, response) => {
       const args = body.args === undefined ? {} : body.args;
       if (args === null || typeof args !== 'object' || Array.isArray(args)) {
         writeJson(response, 400, { error: 'INVALID_ARGS', message: 'args must be a JSON object.' });
+        return;
+      }
+      if (body.action === 'powershell' && typeof args.script !== 'string') {
+        writeJson(response, 400, { error: 'INVALID_ARGS', message: 'powershell requires args.script as a string.' });
         return;
       }
       const timeoutSeconds = body.timeoutSeconds === undefined ? 30 : Number(body.timeoutSeconds);
