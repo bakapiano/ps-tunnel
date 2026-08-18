@@ -46,6 +46,7 @@ $sessionPath = Join-Path $serverDirectory 'session.js'
 $controlPath = Join-Path $serverDirectory 'ctl.ps1'
 $mcpServerPath = Join-Path $serverDirectory 'mcp-server.mjs'
 $mcpSmokePath = Join-Path $serverDirectory 'mcp-smoke.mjs'
+$mcpConcurrencySmokePath = Join-Path $serverDirectory 'mcp-concurrency-smoke.mjs'
 $nodePath = (Get-Command node -ErrorAction Stop).Source
 $codexExecutable = $null
 if ($CodexMcp) {
@@ -109,6 +110,7 @@ $config = [ordered]@{
     sessionTimeoutSeconds = 5
     maxMessageBytes = 262144
     maxTaskTimeoutSeconds = 30
+    maxConcurrentTasksPerAgent = 4
     enableTestHooks = $true
 }
 $config | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $configPath -Encoding UTF8
@@ -195,6 +197,7 @@ try {
         '-ReconnectMaxSeconds', '2',
         '-SessionReadTimeoutSeconds', '10',
         '-TaskTimeoutSeconds', '10',
+        '-MaxConcurrentTasks', '4',
         '-LauncherMode', 'Always',
         '-LauncherPath', $launcherPath,
         '-LogPath', $clientLog
@@ -210,6 +213,7 @@ try {
     }
     $firstSessionId = [string]$firstStatus.sessionId
     Assert-True ($firstSessionId.Length -gt 0) 'initial session id should be populated'
+    Assert-True ([int]$firstStatus.maxConcurrentTasks -eq 4) 'client and broker should negotiate four concurrent tasks'
 
     [void](Wait-Until -Description 'one-click launcher creation' -Condition {
         if (Test-Path -LiteralPath $launcherPath -PathType Leaf) { return $true }
@@ -270,6 +274,62 @@ try {
     Assert-True ([int]$powerShellResult.result.output.total -eq 10) 'powershell task should execute variables and pipelines'
     Assert-True (-not [string]::IsNullOrWhiteSpace([string]$powerShellResult.result.output.runtime)) 'powershell task should expose its runtime version'
 
+    $heartbeatSessionBefore = Invoke-TestApi -Method GET -Path '/v1/status' -Body $null
+    $heartbeatSessionId = [string](@($heartbeatSessionBefore.agents | Where-Object { $_.agentId -eq 'agent-a' })[0].sessionId)
+    $parallelMarkerA = 'parallel-a-{0}' -f [Guid]::NewGuid().ToString('N')
+    $parallelMarkerB = 'parallel-b-{0}' -f [Guid]::NewGuid().ToString('N')
+    $parallelStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $parallelTaskA = Invoke-TestApi -Method POST -Path '/v1/tasks' -Body @{
+        agentId = 'agent-a'
+        action = 'powershell'
+        args = @{ script = "Start-Sleep -Seconds 7; [pscustomobject]@{ marker = '$parallelMarkerA' }" }
+        timeoutSeconds = 10
+    }
+    $parallelTaskB = Invoke-TestApi -Method POST -Path '/v1/tasks' -Body @{
+        agentId = 'agent-a'
+        action = 'powershell'
+        args = @{ script = "Start-Sleep -Seconds 7; [pscustomobject]@{ marker = '$parallelMarkerB' }" }
+        timeoutSeconds = 10
+    }
+    [void](Wait-Until -Description 'two tasks running concurrently' -Condition {
+        $taskA = Invoke-TestApi -Method GET -Path ('/v1/tasks/{0}' -f $parallelTaskA.id) -Body $null
+        $taskB = Invoke-TestApi -Method GET -Path ('/v1/tasks/{0}' -f $parallelTaskB.id) -Body $null
+        return ($taskA.status -eq 'running' -and $taskB.status -eq 'running')
+    })
+    $parallelStatus = Invoke-TestApi -Method GET -Path '/v1/status' -Body $null
+    $parallelAgent = @($parallelStatus.agents | Where-Object { $_.agentId -eq 'agent-a' })[0]
+    Assert-True ([int]$parallelAgent.activeTasks -eq 2) 'status should report both active tasks'
+    $parallelResultA = Wait-Task -TaskId $parallelTaskA.id
+    $parallelResultB = Wait-Task -TaskId $parallelTaskB.id
+    $parallelStopwatch.Stop()
+    Assert-True ($parallelResultA.status -eq 'succeeded') 'first parallel task should succeed'
+    Assert-True ($parallelResultB.status -eq 'succeeded') 'second parallel task should succeed'
+    Assert-True ($parallelResultA.result.output.marker -eq $parallelMarkerA) 'first parallel task should preserve its output'
+    Assert-True ($parallelResultB.result.output.marker -eq $parallelMarkerB) 'second parallel task should preserve its output'
+    Assert-True ($parallelStopwatch.Elapsed.TotalSeconds -lt 12) 'two seven-second tasks should complete in parallel'
+    $heartbeatSessionAfter = Invoke-TestApi -Method GET -Path '/v1/status' -Body $null
+    $heartbeatAgentAfter = @($heartbeatSessionAfter.agents | Where-Object { $_.agentId -eq 'agent-a' })[0]
+    Assert-True ($heartbeatAgentAfter.connected -eq $true) 'agent should remain connected during parallel long-running tasks'
+    Assert-True ([string]$heartbeatAgentAfter.sessionId -eq $heartbeatSessionId) 'parallel tasks should preserve the authenticated session'
+
+    $timeoutTask = Invoke-TestApi -Method POST -Path '/v1/tasks' -Body @{
+        agentId = 'agent-a'
+        action = 'powershell'
+        args = @{ script = 'Start-Sleep -Seconds 30' }
+        timeoutSeconds = 2
+    }
+    $timeoutResult = Wait-Task -TaskId $timeoutTask.id
+    Assert-True ($timeoutResult.status -eq 'failed') 'timed-out worker task should fail'
+    Assert-True ($timeoutResult.result.error.code -eq 'TASK_TIMEOUT') 'timed-out worker should return TASK_TIMEOUT'
+    $postTimeoutTask = Invoke-TestApi -Method POST -Path '/v1/tasks' -Body @{
+        agentId = 'agent-a'; action = 'ping'; args = @{}; timeoutSeconds = 10
+    }
+    $postTimeoutResult = Wait-Task -TaskId $postTimeoutTask.id
+    Assert-True ($postTimeoutResult.status -eq 'succeeded') 'task after a worker timeout should succeed'
+    $postTimeoutStatus = Invoke-TestApi -Method GET -Path '/v1/status' -Body $null
+    $postTimeoutAgent = @($postTimeoutStatus.agents | Where-Object { $_.agentId -eq 'agent-a' })[0]
+    Assert-True ([string]$postTimeoutAgent.sessionId -eq $heartbeatSessionId) 'worker timeout should preserve the authenticated session'
+
     $env:PS_TUNNEL_CONTROL_TOKEN = $controlToken
     $env:PS_TUNNEL_CONTROL_BASE_URI = $baseUri
     $mcpMarker = 'mcp-{0}' -f [Guid]::NewGuid().ToString('N')
@@ -287,6 +347,20 @@ try {
     Assert-True (@($mcpResult.tools).Count -eq 4) 'MCP tools/list should return all four tools'
     Assert-True (-not [string]::IsNullOrWhiteSpace([string]$mcpResult.runTaskId)) 'MCP run_powershell should return a task id'
     Assert-True (-not [string]::IsNullOrWhiteSpace([string]$mcpResult.submittedTaskId)) 'MCP submit_powershell should return a task id'
+
+    $mcpConcurrencyMarker = 'mcp-parallel-{0}' -f [Guid]::NewGuid().ToString('N')
+    $mcpConcurrencyOutput = @(& $nodePath $mcpConcurrencySmokePath `
+        --server $mcpServerPath `
+        --agent 'agent-a' `
+        --marker $mcpConcurrencyMarker `
+        --cwd $mcpWorkspace)
+    if ($LASTEXITCODE -ne 0) {
+        throw ('MCP concurrency smoke process exited with code {0}.' -f $LASTEXITCODE)
+    }
+    $mcpConcurrencyResult = ($mcpConcurrencyOutput -join "`n") | ConvertFrom-Json
+    Assert-True ($mcpConcurrencyResult.ok -eq $true) 'two MCP instances should complete concurrent calls'
+    Assert-True ([int]$mcpConcurrencyResult.elapsedMs -lt 12000) 'two MCP PowerShell calls should execute in parallel'
+    Assert-True (@($mcpConcurrencyResult.taskIds).Count -eq 2) 'MCP concurrency test should return two task ids'
 
     if ($CodexMcp) {
         $codexMarker = 'codex-{0}' -f [Guid]::NewGuid().ToString('N')
@@ -410,7 +484,7 @@ Use the MCP tools for execution. After the tool succeeds, reply with one compact
 
     $testSucceeded = $true
     $codexCoverage = if ($CodexMcp) { ', Codex model MCP invocation' } else { '' }
-    Write-Host ('E2E PASS: auth, protected launcher execution, arbitrary PowerShell, MCP SDK tools{0}, echo, host info, forced disconnect, and reconnect. Session {1} -> {2} -> {3}' -f $codexCoverage, $firstSessionId, $secondStatus.sessionId, $launcherStatus.sessionId)
+    Write-Host ('E2E PASS: auth, protected launcher, parallel workers, dual MCP instances, timeout recovery{0}, forced disconnect, and reconnect. Session {1} -> {2} -> {3}' -f $codexCoverage, $firstSessionId, $secondStatus.sessionId, $launcherStatus.sessionId)
 }
 finally {
     $env:PS_TUNNEL_AGENT_SECRET = $originalAgentSecret

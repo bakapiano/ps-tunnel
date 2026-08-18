@@ -24,6 +24,8 @@ A: client.ps1 -------------------------> SSH :2222 -> ssh-server.js
 - MCP server 由 AI 客户端通过 stdio 启动，并使用环境变量中的控制令牌访问回环控制 API。
 - A 使用 `StrictHostKeyChecking=yes` 固定校验 B 的 SSH host key。
 - 客户端采用带抖动的指数退避自动重连。
+- 客户端通过非阻塞事件循环持续处理心跳，每条任务在独立 PowerShell worker 中运行并转换结果。
+- 同一 Agent 默认并行执行 4 条任务；多个 MCP/CLI 实例共享 Broker，可同时提交并等待各自的 PowerShell 命令。
 - 任务动作包括 `ping`、`echo`、`get_host_info` 和可执行任意脚本内容的 `powershell`。
 
 该设计面向明确授权的设备。请按组织安全策略保存、分发和轮换密钥。
@@ -116,6 +118,7 @@ $json = $config | ConvertTo-Json -Depth 10
 ```
 
 `controlToken` 只用于 B 本机控制 API；`agents.agent-a` 只用于 A 与 Broker 的应用层认证。两者应保持独立。
+`maxConcurrentTasksPerAgent` 控制 Broker 向每个在线 Agent 同时派发的任务数，模板默认值为 `4`。
 
 ### 3. 生成 SSH host key 和 Agent key
 
@@ -235,6 +238,7 @@ $env:PS_TUNNEL_AGENT_SECRET = '<AGENT_SECRET>'
     -IdentityFile 'C:\ps_tunnel\agent-a-ed25519' `
     -KnownHostsFile 'C:\ps_tunnel\known_hosts-a' `
     -LogPath "$HOME\ps-tunnel-client.log" `
+    -MaxConcurrentTasks 4 `
     -ReconnectInitialSeconds 1 `
     -ReconnectMaxSeconds 30
 ```
@@ -285,7 +289,7 @@ $services = Get-Service | Where-Object Status -eq 'Running'
 ```
 
 `get_host_info` 返回计算机名、当前用户、PowerShell 版本、进程 ID、工作目录和时间。
-`powershell` 在客户端的新 PowerShell runspace 中执行 `args.script`，并把管道输出作为任务结果返回；也可以通过 `-ArgumentsJson '{"script":"Get-Date"}'` 提交。
+`powershell` 在客户端的独立 PowerShell worker 进程中执行 `args.script`，并把管道输出作为任务结果返回；也可以通过 `-ArgumentsJson '{"script":"Get-Date"}'` 提交。worker 执行、结果转换和超时终止均与主协议事件循环隔离。client 在认证时声明 `-MaxConcurrentTasks`，Broker 使用它与 `maxConcurrentTasksPerAgent` 中的较小值；旧版 client 自动按单任务会话处理。
 
 ## 通过 MCP 使用
 
@@ -297,6 +301,8 @@ $services = Get-Service | Where-Object Status -eq 'Running'
 - `get_task`：按 task ID 查询状态和完整结果。
 
 MCP server 默认读取自身同目录的 `config.json`，从中获取控制令牌和控制 API 地址。stdio MCP 启动时会先认证探测控制 API；本机回环服务尚未就绪时，它会静默执行 `start.ps1`，等 Broker 和 SSH 监听器就绪后再开始 MCP 协议通信。重复启动会复用已经就绪的进程。
+
+Codex、Claude Code、GitHub Copilot CLI 等工具各自启动独立 stdio MCP 进程；这些进程连接同一个回环控制 API 和 Broker。来自多个 CLI/MCP 会话的任务会进入同一队列，并按 Agent 的并发配置同时派发。
 
 标准部署只需让 AI 客户端执行 `server/mcp-server.mjs`。以下环境变量用于自定义部署：
 
@@ -453,7 +459,7 @@ pwsh -NoProfile -File .\server\e2e.ps1 `
     -ClientPowerShellPath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
 ```
 
-以上测试会通过官方 MCP client SDK 完成 `initialize`、`tools/list` 和四个 tools 的调用。加入 `-CodexMcp` 会再启动本机 Codex 临时会话，让模型实际调用 `list_agents` 和 `run_powershell`，并在 Broker 状态与模型最终回复中核对唯一 marker：
+以上测试会通过官方 MCP client SDK 完成 `initialize`、`tools/list` 和四个 tools 的调用，并启动两个独立 MCP stdio 实例并发执行两条 7 秒 PowerShell 任务。测试同时验证任务运行期间心跳、超时 worker 终止、后续任务恢复和 session 连续性。加入 `-CodexMcp` 会再启动本机 Codex 临时会话，让模型实际调用 `list_agents` 和 `run_powershell`，并在 Broker 状态与模型最终回复中核对唯一 marker：
 
 ```powershell
 pwsh -NoProfile -File .\server\e2e.ps1 -CodexMcp
@@ -469,7 +475,7 @@ pwsh -NoProfile -File .\server\mcp-autostart-e2e.ps1 -CodexMcp
 
 专项测试的配置、状态、SSH 密钥、日志、MCP 工作区和 Codex 状态都位于 `%TEMP%/ps-tunnel-mcp-autostart-*`，成功后整体删除；当前仓库和现有 Codex resume 状态只参与只读加载。
 
-完整测试覆盖 HMAC 认证、DPAPI 启动脚本生成与实际执行、Secret 检查、任意 PowerShell、MCP SDK、Codex 模型调用、`echo`、主机信息、强制断线、自动重连和重连后任务。生产部署还应从 A 执行一次 `Test-NetConnection` 和详细 SSH 握手检查。
+完整测试覆盖 HMAC 认证、DPAPI 启动脚本生成与实际执行、Secret 检查、任意 PowerShell、并行 worker、双 MCP 实例、Codex 模型调用、任务超时恢复、`echo`、主机信息、强制断线、自动重连和重连后任务。生产部署还应从 A 执行一次 `Test-NetConnection` 和详细 SSH 握手检查。
 
 ## 密钥轮换
 

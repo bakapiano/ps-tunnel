@@ -323,6 +323,10 @@ function normalizeAgent(agent) {
     sessionId: agent.sessionId === null || agent.sessionId === undefined ? null : String(agent.sessionId),
     connectedAt: agent.connectedAt === null || agent.connectedAt === undefined ? null : String(agent.connectedAt),
     lastSeen: agent.lastSeen === null || agent.lastSeen === undefined ? null : String(agent.lastSeen),
+    activeTasks: Number.isInteger(agent.activeTasks) && agent.activeTasks >= 0 ? agent.activeTasks : 0,
+    maxConcurrentTasks: Number.isInteger(agent.maxConcurrentTasks) && agent.maxConcurrentTasks > 0
+      ? agent.maxConcurrentTasks
+      : 1,
   };
 }
 
@@ -413,6 +417,8 @@ const agentSchema = z.object({
   sessionId: z.string().nullable(),
   connectedAt: z.string().nullable(),
   lastSeen: z.string().nullable(),
+  activeTasks: z.number().int().nonnegative(),
+  maxConcurrentTasks: z.number().int().positive(),
 });
 
 const taskResultSchema = z.object({

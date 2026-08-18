@@ -23,6 +23,8 @@ param(
     [string]$AgentSecret = $env:PS_TUNNEL_AGENT_SECRET,
     [ValidateRange(1, 300)]
     [int]$TaskTimeoutSeconds = 30,
+    [ValidateRange(1, 64)]
+    [int]$MaxConcurrentTasks = 4,
     [ValidateRange(1024, 1048576)]
     [int]$MaxMessageBytes = 262144,
     [ValidateRange(1, 3600)]
@@ -46,6 +48,7 @@ $ErrorActionPreference = 'Stop'
 $ProtocolVersion = 1
 $ClientScriptPath = [System.IO.Path]::GetFullPath($PSCommandPath)
 $script:LauncherOfferHandled = $false
+$script:PendingProtocolReadTask = $null
 
 function Write-AgentLog {
     param(
@@ -77,6 +80,7 @@ function Get-LauncherParameters {
         AgentId = $AgentId
         Transport = $Transport
         TaskTimeoutSeconds = $TaskTimeoutSeconds
+        MaxConcurrentTasks = $MaxConcurrentTasks
         MaxMessageBytes = $MaxMessageBytes
         SessionReadTimeoutSeconds = $SessionReadTimeoutSeconds
         ReconnectInitialSeconds = $ReconnectInitialSeconds
@@ -425,60 +429,270 @@ $AllowedTaskScript = {
     }
 }
 
-function Invoke-AllowedTask {
-    param(
-        [Parameter(Mandatory = $true)][string]$Action,
-        [Parameter(Mandatory = $true)][hashtable]$Arguments
-    )
+$TaskWorkerScript = {
+    Set-StrictMode -Version 2.0
+    $ErrorActionPreference = 'Stop'
 
-    $runner = [System.Management.Automation.PowerShell]::Create()
-    $asyncResult = $null
+    $inputPath = $env:PS_TUNNEL_TASK_INPUT
+    $outputPath = $env:PS_TUNNEL_TASK_OUTPUT
+    $utf8 = New-Object System.Text.UTF8Encoding($false)
+    $runner = $null
+    $payload = $null
+    $result = $null
+
     try {
-        [void]$runner.AddScript($AllowedTaskScript.ToString())
-        [void]$runner.AddArgument($Action)
-        [void]$runner.AddArgument($Arguments)
-        $asyncResult = $runner.BeginInvoke()
-        $completed = $asyncResult.AsyncWaitHandle.WaitOne($TaskTimeoutSeconds * 1000)
-        if (-not $completed) {
-            $runner.Stop()
-            return [pscustomobject]@{
-                ok = $false
-                output = $null
-                error = [ordered]@{ code = 'TASK_TIMEOUT'; message = 'Task execution exceeded the local timeout.' }
-            }
+        $payload = [System.IO.File]::ReadAllText($inputPath, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+        $arguments = @{}
+        foreach ($property in $payload.arguments.PSObject.Properties) {
+            $arguments[[string]$property.Name] = $property.Value
         }
 
-        $items = @($runner.EndInvoke($asyncResult))
+        $runner = [System.Management.Automation.PowerShell]::Create()
+        [void]$runner.AddScript([string]$payload.allowedTaskScript)
+        [void]$runner.AddArgument([string]$payload.action)
+        [void]$runner.AddArgument($arguments)
+        $items = @($runner.Invoke())
+
         if ($runner.HadErrors) {
             $messages = @($runner.Streams.Error | ForEach-Object { $_.Exception.Message })
-            return [pscustomobject]@{
+            $result = [ordered]@{
                 ok = $false
                 output = $null
                 error = [ordered]@{ code = 'TASK_FAILED'; message = ($messages -join '; ') }
             }
         }
+        else {
+            $output = $null
+            if ($items.Count -eq 1) {
+                $output = $items[0]
+            }
+            elseif ($items.Count -gt 1) {
+                $output = $items
+            }
+            $result = [ordered]@{ ok = $true; output = $output; error = $null }
+        }
+    }
+    catch {
+        $result = [ordered]@{
+            ok = $false
+            output = $null
+            error = [ordered]@{ code = 'TASK_WORKER_FAILED'; message = $_.Exception.Message }
+        }
+    }
+    finally {
+        if ($null -ne $runner) {
+            $runner.Dispose()
+        }
+    }
 
-        $output = $null
-        if ($items.Count -eq 1) {
-            $output = $items[0]
+    try {
+        $json = $result | ConvertTo-Json -Compress -Depth 16
+    }
+    catch {
+        $result = [ordered]@{
+            ok = $false
+            output = $null
+            error = [ordered]@{ code = 'RESULT_SERIALIZATION_FAILED'; message = $_.Exception.Message }
         }
-        elseif ($items.Count -gt 1) {
-            $output = $items
+        $json = $result | ConvertTo-Json -Compress -Depth 6
+    }
+
+    $maxResultBytes = if ($null -ne $payload -and $null -ne $payload.maxResultBytes) {
+        [int]$payload.maxResultBytes
+    }
+    else {
+        258048
+    }
+    if ([System.Text.Encoding]::UTF8.GetByteCount($json) -gt $maxResultBytes) {
+        $result = [ordered]@{
+            ok = $false
+            output = $null
+            error = [ordered]@{ code = 'RESULT_TOO_LARGE'; message = 'Task result exceeded the protocol size limit.' }
         }
-        return [pscustomobject]@{ ok = $true; output = $output; error = $null }
+        $json = $result | ConvertTo-Json -Compress -Depth 6
+    }
+    [System.IO.File]::WriteAllText($outputPath, $json, $utf8)
+}
+
+$TaskWorkerEncodedCommand = [Convert]::ToBase64String(
+    [System.Text.Encoding]::Unicode.GetBytes($TaskWorkerScript.ToString())
+)
+
+function Remove-TaskWorkerDirectory {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $tempRoot = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath())
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
+    if (-not $fullPath.StartsWith($tempRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw ('Task worker path escaped the temporary directory: {0}' -f $fullPath)
+    }
+    if (Test-Path -LiteralPath $fullPath) {
+        Remove-Item -LiteralPath $fullPath -Recurse -Force
+    }
+}
+
+function Start-AllowedTaskWorker {
+    param(
+        [Parameter(Mandatory = $true)][string]$TaskId,
+        [Parameter(Mandatory = $true)][string]$Action,
+        [Parameter(Mandatory = $true)][hashtable]$Arguments,
+        [Parameter(Mandatory = $true)][DateTimeOffset]$StartedAt,
+        [Parameter(Mandatory = $true)][DateTimeOffset]$Deadline
+    )
+
+    $taskDirectory = Join-Path ([System.IO.Path]::GetTempPath()) (
+        'ps-tunnel-task-{0}-{1}' -f $TaskId, [Guid]::NewGuid().ToString('N')
+    )
+    $inputPath = Join-Path $taskDirectory 'input.json'
+    $outputPath = Join-Path $taskDirectory 'output.json'
+    $process = $null
+    try {
+        [void](New-Item -ItemType Directory -Path $taskDirectory)
+        $payload = [ordered]@{
+            action = $Action
+            arguments = $Arguments
+            allowedTaskScript = $AllowedTaskScript.ToString()
+            maxResultBytes = [Math]::Max(512, $MaxMessageBytes - 4096)
+        }
+        $payloadJson = $payload | ConvertTo-Json -Compress -Depth 16
+        [System.IO.File]::WriteAllText(
+            $inputPath,
+            $payloadJson,
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+
+        $powerShellPath = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+        $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $startInfo.FileName = $powerShellPath
+        $startInfo.Arguments = Join-NativeArguments -ArgumentList @(
+            '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+            '-EncodedCommand', $TaskWorkerEncodedCommand
+        )
+        $startInfo.WorkingDirectory = (Get-Location).Path
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $true
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $true
+        $startInfo.EnvironmentVariables['PS_TUNNEL_TASK_INPUT'] = $inputPath
+        $startInfo.EnvironmentVariables['PS_TUNNEL_TASK_OUTPUT'] = $outputPath
+
+        $process = New-Object System.Diagnostics.Process
+        $process.StartInfo = $startInfo
+        if (-not $process.Start()) {
+            throw 'PowerShell task worker did not start.'
+        }
+        $standardOutputTask = $process.StandardOutput.ReadToEndAsync()
+        $standardErrorTask = $process.StandardError.ReadToEndAsync()
+        return [pscustomobject]@{
+            Id = $TaskId
+            Action = $Action
+            StartedAt = $StartedAt
+            Deadline = $Deadline
+            Process = $process
+            StandardOutputTask = $standardOutputTask
+            StandardErrorTask = $standardErrorTask
+            Directory = $taskDirectory
+            OutputPath = $outputPath
+        }
+    }
+    catch {
+        if ($null -ne $process) {
+            $process.Dispose()
+        }
+        try {
+            Remove-TaskWorkerDirectory -Path $taskDirectory
+        }
+        catch {
+            # Preserve the worker startup failure as the primary error.
+        }
+        throw
+    }
+}
+
+function Stop-AllowedTaskWorker {
+    param([Parameter(Mandatory = $true)]$Worker)
+
+    try {
+        if (-not $Worker.Process.HasExited) {
+            $Worker.Process.Kill()
+            $Worker.Process.WaitForExit(1000) | Out-Null
+        }
+    }
+    catch {
+        Write-AgentLog -Level 'WARN' -Message ('Task worker termination failed: {0}' -f $_.Exception.Message)
+    }
+    finally {
+        try {
+            $Worker.Process.Dispose()
+        }
+        catch {
+            Write-AgentLog -Level 'WARN' -Message ('Task worker disposal failed: {0}' -f $_.Exception.Message)
+        }
+        try {
+            Remove-TaskWorkerDirectory -Path $Worker.Directory
+        }
+        catch {
+            Write-AgentLog -Level 'WARN' -Message ('Task worker file cleanup failed: {0}' -f $_.Exception.Message)
+        }
+    }
+}
+
+function Complete-AllowedTaskWorker {
+    param([Parameter(Mandatory = $true)]$Worker)
+
+    try {
+        $Worker.Process.WaitForExit()
+        $standardOutput = [string]$Worker.StandardOutputTask.Result
+        $standardError = [string]$Worker.StandardErrorTask.Result
+        if (-not (Test-Path -LiteralPath $Worker.OutputPath -PathType Leaf)) {
+            $detail = if ([string]::IsNullOrWhiteSpace($standardError)) {
+                'Task worker exited without a result.'
+            }
+            else {
+                $standardError.Trim()
+            }
+            return [pscustomobject]@{
+                ok = $false
+                output = $null
+                error = [ordered]@{ code = 'TASK_WORKER_FAILED'; message = $detail }
+            }
+        }
+        $resultFile = Get-Item -LiteralPath $Worker.OutputPath
+        if ($resultFile.Length -gt $MaxMessageBytes) {
+            return [pscustomobject]@{
+                ok = $false
+                output = $null
+                error = [ordered]@{ code = 'RESULT_TOO_LARGE'; message = 'Task result exceeded the protocol size limit.' }
+            }
+        }
+        $resultJson = [System.IO.File]::ReadAllText($Worker.OutputPath, [System.Text.Encoding]::UTF8)
+        $result = $resultJson | ConvertFrom-Json
+        return [pscustomobject]@{
+            ok = [bool]$result.ok
+            output = $result.output
+            error = $result.error
+        }
     }
     catch {
         return [pscustomobject]@{
             ok = $false
             output = $null
-            error = [ordered]@{ code = 'TASK_FAILED'; message = $_.Exception.Message }
+            error = [ordered]@{ code = 'TASK_WORKER_FAILED'; message = $_.Exception.Message }
         }
     }
     finally {
-        if ($null -ne $asyncResult) {
-            $asyncResult.AsyncWaitHandle.Dispose()
+        try {
+            $Worker.Process.Dispose()
         }
-        $runner.Dispose()
+        catch {
+            Write-AgentLog -Level 'WARN' -Message ('Task worker disposal failed: {0}' -f $_.Exception.Message)
+        }
+        try {
+            Remove-TaskWorkerDirectory -Path $Worker.Directory
+        }
+        catch {
+            Write-AgentLog -Level 'WARN' -Message ('Task worker file cleanup failed: {0}' -f $_.Exception.Message)
+        }
     }
 }
 
@@ -497,29 +711,99 @@ function Send-ProtocolMessage {
     $Writer.Flush()
 }
 
+function ConvertFrom-ProtocolLine {
+    param([AllowNull()][string]$Line)
+
+    if ($null -eq $Line) {
+        return $null
+    }
+    if ([System.Text.Encoding]::UTF8.GetByteCount($Line) -gt $MaxMessageBytes) {
+        throw 'Received protocol message exceeds the configured size limit.'
+    }
+    try {
+        return ($Line | ConvertFrom-Json)
+    }
+    catch {
+        throw ('Received invalid protocol JSON: {0}' -f $_.Exception.Message)
+    }
+}
+
+function Wait-ProtocolMessage {
+    param(
+        [Parameter(Mandatory = $true)][System.IO.StreamReader]$Reader,
+        [ValidateRange(0, 3600000)][int]$TimeoutMilliseconds
+    )
+
+    if ($null -eq $script:PendingProtocolReadTask) {
+        $script:PendingProtocolReadTask = $Reader.ReadLineAsync()
+    }
+    if (-not $script:PendingProtocolReadTask.Wait($TimeoutMilliseconds)) {
+        return [pscustomobject]@{ Received = $false; Message = $null }
+    }
+
+    $line = $script:PendingProtocolReadTask.Result
+    $script:PendingProtocolReadTask = $null
+    return [pscustomobject]@{
+        Received = $true
+        Message = (ConvertFrom-ProtocolLine -Line $line)
+    }
+}
+
+function Send-TaskExecutionResult {
+    param(
+        [Parameter(Mandatory = $true)][string]$TaskId,
+        [Parameter(Mandatory = $true)][DateTimeOffset]$StartedAt,
+        [Parameter(Mandatory = $true)]$Execution,
+        [Parameter(Mandatory = $true)][System.IO.StreamWriter]$Writer
+    )
+
+    $completedAt = [DateTimeOffset]::UtcNow
+    $resultMessage = [ordered]@{
+        type = 'result'
+        protocol = $ProtocolVersion
+        id = $TaskId
+        ok = [bool]$Execution.ok
+        output = $Execution.output
+        error = $Execution.error
+        startedAt = $StartedAt.ToString('o')
+        completedAt = $completedAt.ToString('o')
+        durationMs = [Math]::Round(($completedAt - $StartedAt).TotalMilliseconds)
+    }
+    $reportedOk = [bool]$Execution.ok
+    try {
+        Send-ProtocolMessage -Writer $Writer -Message $resultMessage
+    }
+    catch {
+        if ($_.Exception.Message -notmatch '^Protocol message is \d+ bytes; limit is \d+\.$') {
+            throw
+        }
+        $reportedOk = $false
+        Send-ProtocolMessage -Writer $Writer -Message ([ordered]@{
+            type = 'result'
+            protocol = $ProtocolVersion
+            id = $TaskId
+            ok = $false
+            output = $null
+            error = [ordered]@{ code = 'RESULT_TOO_LARGE'; message = 'Task result exceeded the protocol size limit.' }
+            startedAt = $StartedAt.ToString('o')
+            completedAt = [DateTimeOffset]::UtcNow.ToString('o')
+            durationMs = [Math]::Round(([DateTimeOffset]::UtcNow - $StartedAt).TotalMilliseconds)
+        })
+    }
+    Write-AgentLog -Message ('Completed task {0}; ok={1}.' -f $TaskId, $reportedOk)
+}
+
 function Read-ProtocolMessage {
     param(
         [Parameter(Mandatory = $true)][System.IO.StreamReader]$Reader,
         [ValidateRange(1, 3600)][int]$TimeoutSeconds
     )
 
-    $readTask = $Reader.ReadLineAsync()
-    if (-not $readTask.Wait($TimeoutSeconds * 1000)) {
+    $protocolRead = Wait-ProtocolMessage -Reader $Reader -TimeoutMilliseconds ($TimeoutSeconds * 1000)
+    if (-not $protocolRead.Received) {
         throw ('No protocol message arrived within {0} seconds.' -f $TimeoutSeconds)
     }
-    $line = $readTask.Result
-    if ($null -eq $line) {
-        return $null
-    }
-    if ([System.Text.Encoding]::UTF8.GetByteCount($line) -gt $MaxMessageBytes) {
-        throw 'Received protocol message exceeds the configured size limit.'
-    }
-    try {
-        return ($line | ConvertFrom-Json)
-    }
-    catch {
-        throw ('Received invalid protocol JSON: {0}' -f $_.Exception.Message)
-    }
+    return $protocolRead.Message
 }
 
 function Resolve-RequiredFile {
@@ -673,6 +957,7 @@ function Invoke-AgentSession {
 
     $reader = $Process.StandardOutput
     $writer = $Process.StandardInput
+    $script:PendingProtocolReadTask = $null
     $challenge = Read-ProtocolMessage -Reader $reader -TimeoutSeconds 20
     if ($null -eq $challenge) {
         throw 'Transport closed before authentication challenge.'
@@ -694,6 +979,7 @@ function Invoke-AgentSession {
         agentId = $AgentId
         nonce = $clientNonce
         proof = $authProof
+        maxConcurrentTasks = $MaxConcurrentTasks
     })
 
     $ready = Read-ProtocolMessage -Reader $reader -TimeoutSeconds 20
@@ -712,96 +998,143 @@ function Invoke-AgentSession {
     if (-not (Test-ConstantTimeString -Left $expectedReadyProof -Right ([string]$ready.proof))) {
         throw 'Server authentication proof is invalid.'
     }
-
-    Write-AgentLog -Message ('Authenticated session {0}.' -f $sessionId)
-    Invoke-LauncherOffer
-    while ($true) {
-        $message = Read-ProtocolMessage -Reader $reader -TimeoutSeconds $SessionReadTimeoutSeconds
-        if ($null -eq $message) {
-            throw 'Transport reached end-of-stream.'
+    $sessionMaxConcurrentTasks = 1
+    if (($ready.PSObject.Properties.Name -contains 'maxConcurrentTasks') -and $null -ne $ready.maxConcurrentTasks) {
+        $serverConcurrency = [int]$ready.maxConcurrentTasks
+        if ($serverConcurrency -lt 1 -or $serverConcurrency -gt 64) {
+            throw 'Server returned an invalid task concurrency limit.'
         }
+        $sessionMaxConcurrentTasks = [Math]::Min($MaxConcurrentTasks, $serverConcurrency)
+    }
 
-        switch ([string]$message.type) {
-            'ping' {
-                Send-ProtocolMessage -Writer $writer -Message ([ordered]@{
-                    type = 'pong'
-                    protocol = $ProtocolVersion
-                    at = [DateTimeOffset]::UtcNow.ToString('o')
-                })
-            }
-            'task' {
-                $taskId = [string]$message.id
-                $action = [string]$message.action
-                if ($taskId -notmatch '^[A-Za-z0-9-]{8,64}$') {
-                    throw 'Task id is invalid.'
+    Write-AgentLog -Message ('Authenticated session {0}; maxConcurrentTasks={1}.' -f $sessionId, $sessionMaxConcurrentTasks)
+    Invoke-LauncherOffer
+    $activeTasks = @{}
+    $lastProtocolMessageAt = [DateTimeOffset]::UtcNow
+    try {
+        while ($true) {
+            $protocolRead = Wait-ProtocolMessage -Reader $reader -TimeoutMilliseconds 250
+            if ($protocolRead.Received) {
+                $lastProtocolMessageAt = [DateTimeOffset]::UtcNow
+                $message = $protocolRead.Message
+                if ($null -eq $message) {
+                    throw 'Transport reached end-of-stream.'
                 }
 
-                $started = [DateTimeOffset]::UtcNow
-                $execution = $null
-                if ($null -ne $message.deadline -and -not [string]::IsNullOrWhiteSpace([string]$message.deadline)) {
-                    if ($message.deadline -is [DateTime]) {
-                        $deadline = [DateTimeOffset]$message.deadline
+                switch ([string]$message.type) {
+                    'ping' {
+                        Send-ProtocolMessage -Writer $writer -Message ([ordered]@{
+                            type = 'pong'
+                            protocol = $ProtocolVersion
+                            at = [DateTimeOffset]::UtcNow.ToString('o')
+                        })
                     }
-                    elseif ($message.deadline -is [DateTimeOffset]) {
-                        $deadline = $message.deadline
-                    }
-                    else {
-                        $deadline = [DateTimeOffset]::Parse(
-                            [string]$message.deadline,
-                            [System.Globalization.CultureInfo]::InvariantCulture,
-                            [System.Globalization.DateTimeStyles]::RoundtripKind
-                        )
-                    }
-                    if ($deadline -lt $started) {
-                        $execution = [pscustomobject]@{
-                            ok = $false
-                            output = $null
-                            error = [ordered]@{ code = 'TASK_EXPIRED'; message = 'Task deadline passed before execution.' }
+                    'task' {
+                        $taskId = [string]$message.id
+                        $action = [string]$message.action
+                        if ($taskId -notmatch '^[A-Za-z0-9-]{8,64}$') {
+                            throw 'Task id is invalid.'
+                        }
+                        if ($activeTasks.ContainsKey($taskId)) {
+                            throw ('Task is already active: {0}' -f $taskId)
+                        }
+
+                        $startedAt = [DateTimeOffset]::UtcNow
+                        $deadline = $startedAt.AddSeconds($TaskTimeoutSeconds)
+                        if ($null -ne $message.deadline -and -not [string]::IsNullOrWhiteSpace([string]$message.deadline)) {
+                            if ($message.deadline -is [DateTime]) {
+                                $serverDeadline = [DateTimeOffset]$message.deadline
+                            }
+                            elseif ($message.deadline -is [DateTimeOffset]) {
+                                $serverDeadline = $message.deadline
+                            }
+                            else {
+                                $serverDeadline = [DateTimeOffset]::Parse(
+                                    [string]$message.deadline,
+                                    [System.Globalization.CultureInfo]::InvariantCulture,
+                                    [System.Globalization.DateTimeStyles]::RoundtripKind
+                                )
+                            }
+                            if ($serverDeadline -lt $deadline) {
+                                $deadline = $serverDeadline
+                            }
+                        }
+
+                        if ($deadline -le $startedAt) {
+                            Send-TaskExecutionResult -TaskId $taskId -StartedAt $startedAt -Writer $writer -Execution ([pscustomobject]@{
+                                ok = $false
+                                output = $null
+                                error = [ordered]@{ code = 'TASK_EXPIRED'; message = 'Task deadline passed before execution.' }
+                            })
+                        }
+                        elseif ($activeTasks.Count -ge $sessionMaxConcurrentTasks) {
+                            Send-TaskExecutionResult -TaskId $taskId -StartedAt $startedAt -Writer $writer -Execution ([pscustomobject]@{
+                                ok = $false
+                                output = $null
+                                error = [ordered]@{ code = 'CLIENT_BUSY'; message = 'Client concurrency limit was reached.' }
+                            })
+                        }
+                        else {
+                            $arguments = ConvertTo-StringKeyHashtable -Value $message.args
+                            try {
+                                $worker = Start-AllowedTaskWorker -TaskId $taskId -Action $action -Arguments $arguments `
+                                    -StartedAt $startedAt -Deadline $deadline
+                                $activeTasks[$taskId] = $worker
+                                Write-AgentLog -Message ('Executing task {0} ({1}); active={2}.' -f $taskId, $action, $activeTasks.Count)
+                            }
+                            catch {
+                                Send-TaskExecutionResult -TaskId $taskId -StartedAt $startedAt -Writer $writer -Execution ([pscustomobject]@{
+                                    ok = $false
+                                    output = $null
+                                    error = [ordered]@{ code = 'TASK_WORKER_FAILED'; message = $_.Exception.Message }
+                                })
+                            }
                         }
                     }
+                    'error' {
+                        throw ('Server protocol error: {0}' -f [string]$message.message)
+                    }
+                    default {
+                        throw ('Unexpected protocol message type: {0}' -f [string]$message.type)
+                    }
                 }
-                if ($null -eq $execution) {
-                    $arguments = ConvertTo-StringKeyHashtable -Value $message.args
-                    Write-AgentLog -Message ('Executing task {0} ({1}).' -f $taskId, $action)
-                    $execution = Invoke-AllowedTask -Action $action -Arguments $arguments
-                }
-                $completed = [DateTimeOffset]::UtcNow
-                $resultMessage = [ordered]@{
-                    type = 'result'
-                    protocol = $ProtocolVersion
-                    id = $taskId
-                    ok = [bool]$execution.ok
-                    output = $execution.output
-                    error = $execution.error
-                    startedAt = $started.ToString('o')
-                    completedAt = $completed.ToString('o')
-                    durationMs = [Math]::Round(($completed - $started).TotalMilliseconds)
-                }
-                try {
-                    Send-ProtocolMessage -Writer $writer -Message $resultMessage
-                }
-                catch {
-                    Send-ProtocolMessage -Writer $writer -Message ([ordered]@{
-                        type = 'result'
-                        protocol = $ProtocolVersion
-                        id = $taskId
+            }
+
+            if (([DateTimeOffset]::UtcNow - $lastProtocolMessageAt).TotalSeconds -gt $SessionReadTimeoutSeconds) {
+                throw ('No protocol message arrived within {0} seconds.' -f $SessionReadTimeoutSeconds)
+            }
+
+            foreach ($taskId in @($activeTasks.Keys)) {
+                $worker = $activeTasks[$taskId]
+                if (-not $worker.Process.HasExited -and [DateTimeOffset]::UtcNow -ge $worker.Deadline) {
+                    Stop-AllowedTaskWorker -Worker $worker
+                    [void]$activeTasks.Remove($taskId)
+                    Send-TaskExecutionResult -TaskId $taskId -StartedAt $worker.StartedAt -Writer $writer -Execution ([pscustomobject]@{
                         ok = $false
                         output = $null
-                        error = [ordered]@{ code = 'RESULT_TOO_LARGE'; message = 'Task result exceeded the protocol size limit.' }
-                        startedAt = $started.ToString('o')
-                        completedAt = [DateTimeOffset]::UtcNow.ToString('o')
-                        durationMs = [Math]::Round(([DateTimeOffset]::UtcNow - $started).TotalMilliseconds)
+                        error = [ordered]@{ code = 'TASK_TIMEOUT'; message = 'Task execution exceeded its deadline.' }
                     })
+                    continue
                 }
-                Write-AgentLog -Message ('Completed task {0}; ok={1}.' -f $taskId, [bool]$execution.ok)
-            }
-            'error' {
-                throw ('Server protocol error: {0}' -f [string]$message.message)
-            }
-            default {
-                throw ('Unexpected protocol message type: {0}' -f [string]$message.type)
+                if ($worker.Process.HasExited) {
+                    $execution = Complete-AllowedTaskWorker -Worker $worker
+                    [void]$activeTasks.Remove($taskId)
+                    Send-TaskExecutionResult -TaskId $taskId -StartedAt $worker.StartedAt `
+                        -Execution $execution -Writer $writer
+                }
             }
         }
+    }
+    finally {
+        foreach ($worker in @($activeTasks.Values)) {
+            try {
+                Stop-AllowedTaskWorker -Worker $worker
+            }
+            catch {
+                Write-AgentLog -Level 'WARN' -Message ('Task worker cleanup failed: {0}' -f $_.Exception.Message)
+            }
+        }
+        $activeTasks.Clear()
     }
 }
 

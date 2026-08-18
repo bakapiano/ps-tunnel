@@ -45,6 +45,7 @@ function readConfig(configPath) {
   config.sessionTimeoutSeconds = Number(config.sessionTimeoutSeconds || 45);
   config.maxMessageBytes = Number(config.maxMessageBytes || 262144);
   config.maxTaskTimeoutSeconds = Number(config.maxTaskTimeoutSeconds || 120);
+  config.maxConcurrentTasksPerAgent = Number(config.maxConcurrentTasksPerAgent ?? 4);
   config.enableTestHooks = config.enableTestHooks === true;
   config.stateFile = path.resolve(directory, config.stateFile || 'state.json');
   config.controlToken = process.env.PS_TUNNEL_CONTROL_TOKEN || config.controlToken;
@@ -66,6 +67,10 @@ function readConfig(configPath) {
   }
   if (!Number.isInteger(config.maxMessageBytes) || config.maxMessageBytes < 1024 || config.maxMessageBytes > 1048576) {
     throw new Error('maxMessageBytes must be between 1024 and 1048576.');
+  }
+  if (!Number.isInteger(config.maxConcurrentTasksPerAgent) ||
+      config.maxConcurrentTasksPerAgent < 1 || config.maxConcurrentTasksPerAgent > 64) {
+    throw new Error('maxConcurrentTasksPerAgent must be between 1 and 64.');
   }
   if (!Number.isInteger(config.maxTaskTimeoutSeconds) || config.maxTaskTimeoutSeconds < 1 || config.maxTaskTimeoutSeconds > 3600) {
     throw new Error('maxTaskTimeoutSeconds must be between 1 and 3600.');
@@ -203,43 +208,50 @@ function dispatchNext(agentId) {
   if (!session || session.socket.destroyed) {
     return;
   }
-  const alreadyRunning = Object.values(state.tasks).some(
+
+  let runningCount = Object.values(state.tasks).filter(
     (task) => task.agentId === agentId && task.status === 'running'
-  );
-  if (alreadyRunning) {
-    return;
-  }
-
-  const queueIndex = state.queue.findIndex((taskId) => {
-    const task = state.tasks[taskId];
-    return task && task.agentId === agentId && task.status === 'queued';
-  });
-  if (queueIndex < 0) {
-    return;
-  }
-
-  const [taskId] = state.queue.splice(queueIndex, 1);
-  const task = state.tasks[taskId];
-  task.status = 'running';
-  task.sessionId = session.sessionId;
-  task.attempts += 1;
-  task.updatedAt = new Date().toISOString();
-  task.deadline = new Date(Date.now() + task.timeoutSeconds * 1000).toISOString();
-  saveState();
-
-  try {
-    sendMessage(session.socket, {
-      type: 'task',
-      protocol: PROTOCOL_VERSION,
-      id: task.id,
-      action: task.action,
-      args: task.args,
-      deadline: task.deadline,
+  ).length;
+  while (runningCount < session.maxConcurrentTasks) {
+    const queueIndex = state.queue.findIndex((taskId) => {
+      const task = state.tasks[taskId];
+      return task && task.agentId === agentId && task.status === 'queued';
     });
-    log('INFO', 'Dispatched task.', { agentId, taskId: task.id, action: task.action, attempt: task.attempts });
-  } catch (error) {
-    log('WARN', 'Task dispatch failed; closing session.', { agentId, taskId: task.id, error: error.message });
-    session.socket.destroy();
+    if (queueIndex < 0) {
+      return;
+    }
+
+    const [taskId] = state.queue.splice(queueIndex, 1);
+    const task = state.tasks[taskId];
+    task.status = 'running';
+    task.sessionId = session.sessionId;
+    task.attempts += 1;
+    task.updatedAt = new Date().toISOString();
+    task.deadline = new Date(Date.now() + task.timeoutSeconds * 1000).toISOString();
+    saveState();
+
+    try {
+      sendMessage(session.socket, {
+        type: 'task',
+        protocol: PROTOCOL_VERSION,
+        id: task.id,
+        action: task.action,
+        args: task.args,
+        deadline: task.deadline,
+      });
+      runningCount += 1;
+      log('INFO', 'Dispatched task.', {
+        agentId,
+        taskId: task.id,
+        action: task.action,
+        attempt: task.attempts,
+        activeTasks: runningCount,
+      });
+    } catch (error) {
+      log('WARN', 'Task dispatch failed; closing session.', { agentId, taskId: task.id, error: error.message });
+      session.socket.destroy();
+      return;
+    }
   }
 }
 
@@ -280,6 +292,10 @@ function authenticateSession(session, message) {
   if (typeof message.nonce !== 'string' || !/^[a-f0-9]{64}$/.test(message.nonce)) {
     throw new Error('Client nonce is invalid.');
   }
+  const requestedConcurrency = message.maxConcurrentTasks === undefined ? 1 : Number(message.maxConcurrentTasks);
+  if (!Number.isInteger(requestedConcurrency) || requestedConcurrency < 1 || requestedConcurrency > 64) {
+    throw new Error('Client task concurrency must be between 1 and 64.');
+  }
 
   const secret = config.agents[message.agentId];
   const authText = `auth|${PROTOCOL_VERSION}|${message.agentId}|${session.serverNonce}|${message.nonce}`;
@@ -300,6 +316,7 @@ function authenticateSession(session, message) {
   session.sessionId = crypto.randomUUID();
   session.connectedAt = new Date().toISOString();
   session.lastSeen = Date.now();
+  session.maxConcurrentTasks = Math.min(config.maxConcurrentTasksPerAgent, requestedConcurrency);
   clearTimeout(session.authTimer);
   sessions.set(session.agentId, session);
 
@@ -310,6 +327,7 @@ function authenticateSession(session, message) {
     sessionId: session.sessionId,
     proof: hmacHex(secret, readyText),
     allowedActions: Array.from(ALLOWED_ACTIONS),
+    maxConcurrentTasks: session.maxConcurrentTasks,
     serverTime: new Date().toISOString(),
   });
   log('INFO', 'Agent authenticated.', { agentId: session.agentId, sessionId: session.sessionId });
@@ -340,6 +358,7 @@ const agentServer = net.createServer((socket) => {
     clientNonce: null,
     connectedAt: null,
     lastSeen: Date.now(),
+    maxConcurrentTasks: 1,
     buffer: '',
     receivedProtocolLine: false,
     authTimer: null,
@@ -460,12 +479,17 @@ function readJsonBody(request) {
 function getStatus() {
   const agents = Object.keys(config.agents).sort().map((agentId) => {
     const session = sessions.get(agentId);
+    const activeTasks = Object.values(state.tasks).filter(
+      task => task.agentId === agentId && task.status === 'running'
+    ).length;
     return {
       agentId,
       connected: Boolean(session && !session.socket.destroyed),
       sessionId: session ? session.sessionId : null,
       connectedAt: session ? session.connectedAt : null,
       lastSeen: session ? new Date(session.lastSeen).toISOString() : null,
+      activeTasks,
+      maxConcurrentTasks: session ? session.maxConcurrentTasks : config.maxConcurrentTasksPerAgent,
     };
   });
   const taskCounts = {};

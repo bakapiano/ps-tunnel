@@ -25,5 +25,6 @@
   "sessionTimeoutSeconds": 45,
   "maxMessageBytes": 262144,
   "maxTaskTimeoutSeconds": 120,
+  "maxConcurrentTasksPerAgent": 4,
   "enableTestHooks": false
 }
