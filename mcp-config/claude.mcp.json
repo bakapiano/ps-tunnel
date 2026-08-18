@@ -5,11 +5,7 @@
       "command": "node",
       "args": [
         "${CLAUDE_PROJECT_DIR:-.}/server/mcp-server.mjs"
-      ],
-      "env": {
-        "PS_TUNNEL_CONTROL_TOKEN": "${PS_TUNNEL_CONTROL_TOKEN}",
-        "PS_TUNNEL_CONTROL_BASE_URI": "${PS_TUNNEL_CONTROL_BASE_URI:-http://127.0.0.1:8766}"
-      }
+      ]
     }
   }
 }

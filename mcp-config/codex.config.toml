@@ -1,8 +1,7 @@
 [mcp_servers.ps_tunnel]
 command = "node"
 args = ["D:/path/to/ps_tunnel/server/mcp-server.mjs"]
-env_vars = ["PS_TUNNEL_CONTROL_TOKEN", "PS_TUNNEL_CONTROL_BASE_URI"]
-startup_timeout_sec = 10
+startup_timeout_sec = 60
 tool_timeout_sec = 120
 required = true
 default_tools_approval_mode = "approve"

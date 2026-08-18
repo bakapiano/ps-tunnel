@@ -10,12 +10,13 @@ if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
     $ConfigPath = Join-Path $PSScriptRoot 'config.json'
 }
 $ConfigPath = (Resolve-Path -LiteralPath $ConfigPath).Path
-$serverDirectory = Split-Path -Parent $ConfigPath
+$configDirectory = Split-Path -Parent $ConfigPath
+$runtimeDirectory = $PSScriptRoot
 $config = Get-Content -Raw -LiteralPath $ConfigPath | ConvertFrom-Json
 $nodePath = (Get-Command node.exe -ErrorAction Stop).Source
-$brokerPath = Join-Path $serverDirectory 'broker.js'
-$sshServerPath = Join-Path $serverDirectory 'ssh-server.js'
-$sshModulePath = Join-Path $serverDirectory 'node_modules\ssh2'
+$brokerPath = Join-Path $runtimeDirectory 'broker.js'
+$sshServerPath = Join-Path $runtimeDirectory 'ssh-server.js'
+$sshModulePath = Join-Path $runtimeDirectory 'node_modules\ssh2'
 
 foreach ($requiredPath in @($brokerPath, $sshServerPath, $sshModulePath)) {
     if (-not (Test-Path -LiteralPath $requiredPath)) {
@@ -84,9 +85,9 @@ if ($null -eq $agentListener) {
     $brokerArguments = Join-NativeArguments -ArgumentList @($brokerPath, '--config', $ConfigPath)
     $brokerProcess = Start-Process -FilePath $nodePath `
         -ArgumentList $brokerArguments `
-        -WorkingDirectory $serverDirectory -WindowStyle Hidden `
-        -RedirectStandardOutput (Join-Path $serverDirectory "broker-$stamp.stdout.log") `
-        -RedirectStandardError (Join-Path $serverDirectory "broker-$stamp.stderr.log") `
+        -WorkingDirectory $runtimeDirectory -WindowStyle Hidden `
+        -RedirectStandardOutput (Join-Path $configDirectory "broker-$stamp.stdout.log") `
+        -RedirectStandardError (Join-Path $configDirectory "broker-$stamp.stderr.log") `
         -PassThru
     $agentListener = Wait-ForListener -Port $agentPort
     $controlListener = Wait-ForListener -Port $controlPort
@@ -104,9 +105,9 @@ if ($null -eq $sshListener) {
     $sshArguments = Join-NativeArguments -ArgumentList @($sshServerPath, '--config', $ConfigPath)
     $sshProcess = Start-Process -FilePath $nodePath `
         -ArgumentList $sshArguments `
-        -WorkingDirectory $serverDirectory -WindowStyle Hidden `
-        -RedirectStandardOutput (Join-Path $serverDirectory "ssh-server-$stamp.stdout.log") `
-        -RedirectStandardError (Join-Path $serverDirectory "ssh-server-$stamp.stderr.log") `
+        -WorkingDirectory $runtimeDirectory -WindowStyle Hidden `
+        -RedirectStandardOutput (Join-Path $configDirectory "ssh-server-$stamp.stdout.log") `
+        -RedirectStandardError (Join-Path $configDirectory "ssh-server-$stamp.stderr.log") `
         -PassThru
     $sshListener = Wait-ForListener -Port $sshPort
     $sshStarted = $true

@@ -41,6 +41,7 @@ server/
   broker.js           Agent 会话、任务队列和本地控制 API
   mcp-server.mjs      标准 stdio MCP server
   mcp-smoke.mjs       官方 MCP SDK client 全链路测试
+  mcp-autostart-e2e.ps1 MCP 自动启动与隔离 Codex 模型测试
   ssh-server.js       基于 ssh2 的受限 SSH 监听器
   session.js          协议 E2E 使用的本地进程桥
   start.ps1           启动或检查 B 端进程
@@ -165,6 +166,8 @@ ssh-keygen.exe -lf .\known_hosts-a
 - `0.0.0.0:2222`：受限 SSH 入口
 
 启动日志写入 `server` 目录并由 Git 忽略。再次运行 `start.ps1` 会检查端口是否由预期进程占用。
+
+这也是独立运行 B 服务的入口。配置 MCP 后，AI 客户端启动 stdio MCP 时会自动执行同一检查和启动流程。
 
 ### 6. 创建 B 的防火墙规则
 
@@ -293,18 +296,22 @@ $services = Get-Service | Where-Object Status -eq 'Running'
 - `submit_powershell`：提交 PowerShell 并立即返回 task ID。
 - `get_task`：按 task ID 查询状态和完整结果。
 
-先在启动 AI 客户端的终端中设置控制令牌；MCP server 默认访问 `http://127.0.0.1:8766`：
+MCP server 默认读取自身同目录的 `config.json`，从中获取控制令牌和控制 API 地址。stdio MCP 启动时会先认证探测控制 API；本机回环服务尚未就绪时，它会静默执行 `start.ps1`，等 Broker 和 SSH 监听器就绪后再开始 MCP 协议通信。重复启动会复用已经就绪的进程。
+
+标准部署只需让 AI 客户端执行 `server/mcp-server.mjs`。以下环境变量用于自定义部署：
+
+- `PS_TUNNEL_SERVER_CONFIG_PATH`：指定另一份 server 配置文件。
+- `PS_TUNNEL_CONTROL_TOKEN`：覆盖配置文件中的控制令牌。
+- `PS_TUNNEL_CONTROL_BASE_URI`：覆盖配置文件推导出的控制 API 地址。
+- `PS_TUNNEL_AUTO_START`：设置为 `true` 或 `false`，默认 `true`。
+- `PS_TUNNEL_POWERSHELL_PATH`：指定执行 `start.ps1` 的 PowerShell。
+- `PS_TUNNEL_SERVER_START_TIMEOUT_MS`：启动等待时间，默认 45000 毫秒。
+
+例如，使用另一份隔离配置：
 
 ```powershell
 Set-Location '<REPOSITORY_ROOT>'
-$env:PS_TUNNEL_CONTROL_TOKEN =
-    (Get-Content .\server\config.json -Raw | ConvertFrom-Json).controlToken
-```
-
-需要连接另一控制地址时设置：
-
-```powershell
-$env:PS_TUNNEL_CONTROL_BASE_URI = 'http://127.0.0.1:8766'
+$env:PS_TUNNEL_SERVER_CONFIG_PATH = 'C:\ps-tunnel-test\config.json'
 ```
 
 ### Codex
@@ -337,7 +344,7 @@ claude
 
 把 `mcp-config/github-copilot.mcp.json` 的内容合并到需要启用 MCP 的工作区级 `.vscode/mcp.json`。打开该工作区后，在 Copilot Chat 的工具列表中启用 `ps_tunnel` tools，即可从 Agent 模式调用。
 
-这三份文件位于纯示例目录，当前仓库不会自动加载 MCP 配置。测试流程通过一次性命令行配置启动 Codex，并把 MCP 与 Codex 的工作目录放入系统临时目录。
+这三份文件位于纯示例目录，当前仓库不会自动加载 MCP 配置。AI 客户端加载配置后会负责启动 stdio MCP，MCP 再负责确保本地 PS Tunnel 服务就绪。
 
 ## 踩坑与诊断
 
@@ -453,6 +460,14 @@ pwsh -NoProfile -File .\server\e2e.ps1 -CodexMcp
 ```
 
 E2E 会在 `%TEMP%/ps-tunnel-e2e-*` 下创建独立的 Broker 状态、MCP 工作区和 Codex 工作区。Codex 使用 `--ephemeral` 与一次性 `-c` 配置，测试成功后自动删除整个临时目录，当前仓库的 Codex resume 状态保持独立。
+
+自动启动专项测试会先确认临时端口为空，再由 MCP 启动临时 Broker 和 SSH server。加入 `-CodexMcp` 后，测试会停止 SDK 阶段启动的服务，创建独立 `CODEX_HOME` 和工作目录，再由真实 Codex 模型启动 MCP、等待 Agent 回连并调用 `run_powershell`：
+
+```powershell
+pwsh -NoProfile -File .\server\mcp-autostart-e2e.ps1 -CodexMcp
+```
+
+专项测试的配置、状态、SSH 密钥、日志、MCP 工作区和 Codex 状态都位于 `%TEMP%/ps-tunnel-mcp-autostart-*`，成功后整体删除；当前仓库和现有 Codex resume 状态只参与只读加载。
 
 完整测试覆盖 HMAC 认证、DPAPI 启动脚本生成与实际执行、Secret 检查、任意 PowerShell、MCP SDK、Codex 模型调用、`echo`、主机信息、强制断线、自动重连和重连后任务。生产部署还应从 A 执行一次 `Test-NetConnection` 和详细 SSH 握手检查。
 

@@ -69,10 +69,17 @@ async function main() {
     const toolNames = listed.tools.map(tool => tool.name).sort();
     assert.deepEqual(toolNames, ['get_task', 'list_agents', 'run_powershell', 'submit_powershell']);
 
-    const agentsResult = await client.callTool({ name: 'list_agents', arguments: {} });
-    assert.equal(agentsResult.isError, undefined);
-    const agents = resultValue(agentsResult);
-    const selectedAgent = agents.agents.find(agent => agent.agentId === options.agent);
+    let selectedAgent = null;
+    const agentDeadline = Date.now() + 15000;
+    while ((!selectedAgent || !selectedAgent.connected) && Date.now() < agentDeadline) {
+      const agentsResult = await client.callTool({ name: 'list_agents', arguments: {} });
+      assert.equal(agentsResult.isError, undefined);
+      const agents = resultValue(agentsResult);
+      selectedAgent = agents.agents.find(agent => agent.agentId === options.agent);
+      if (!selectedAgent?.connected) {
+        await delay(200);
+      }
+    }
     assert.ok(selectedAgent, `Agent ${options.agent} was not returned by list_agents.`);
     assert.equal(selectedAgent.connected, true);
 

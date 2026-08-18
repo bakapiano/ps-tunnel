@@ -1,21 +1,99 @@
 import { McpServer } from '@modelcontextprotocol/server';
 import { serveStdio } from '@modelcontextprotocol/server/stdio';
 import * as z from 'zod/v4';
+import { spawn } from 'node:child_process';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const SERVER_VERSION = '1.1.0';
+const SERVER_VERSION = '1.2.0';
 const DEFAULT_CONTROL_BASE_URI = 'http://127.0.0.1:8766';
+const MODULE_DIRECTORY = path.dirname(fileURLToPath(import.meta.url));
+const DEFAULT_SERVER_CONFIG_PATH = path.join(MODULE_DIRECTORY, 'config.json');
+const DEFAULT_SERVER_START_TIMEOUT_MS = 45000;
+const CONTROL_PROBE_TIMEOUT_MS = 2000;
 const CONTROL_REQUEST_TIMEOUT_MS = 10000;
 const TASK_POLL_INTERVAL_MS = 200;
 const TERMINAL_TASK_STATUSES = new Set(['succeeded', 'failed']);
 
+function nonEmptyEnvironmentValue(name) {
+  const value = process.env[name];
+  return typeof value === 'string' && value.trim().length > 0 ? value.trim() : null;
+}
+
+function readBooleanEnvironment(name, defaultValue) {
+  const value = nonEmptyEnvironmentValue(name);
+  if (value === null) {
+    return defaultValue;
+  }
+  if (['1', 'true', 'yes', 'on'].includes(value.toLowerCase())) {
+    return true;
+  }
+  if (['0', 'false', 'no', 'off'].includes(value.toLowerCase())) {
+    return false;
+  }
+  throw new Error(`${name} must be true or false.`);
+}
+
+function readPositiveIntegerEnvironment(name, defaultValue) {
+  const value = nonEmptyEnvironmentValue(name);
+  if (value === null) {
+    return defaultValue;
+  }
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 1000 || parsed > 300000) {
+    throw new Error(`${name} must be an integer from 1000 through 300000.`);
+  }
+  return parsed;
+}
+
+function readServerConfigurationFile(serverConfigPath, required) {
+  if (!fs.existsSync(serverConfigPath)) {
+    if (required) {
+      throw new Error(`PS Tunnel server config was not found: ${serverConfigPath}`);
+    }
+    return null;
+  }
+  try {
+    return JSON.parse(fs.readFileSync(serverConfigPath, 'utf8').replace(/^\uFEFF/, ''));
+  } catch (error) {
+    throw new Error(`PS Tunnel server config is invalid: ${error.message}`);
+  }
+}
+
+function controlBaseUriFromServerConfig(serverConfiguration) {
+  const controlListen = serverConfiguration?.controlListen;
+  const port = Number(controlListen?.port);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    return null;
+  }
+  let host = typeof controlListen.host === 'string' && controlListen.host.trim().length > 0
+    ? controlListen.host.trim()
+    : '127.0.0.1';
+  if (['0.0.0.0', '::', '[::]'].includes(host)) {
+    host = '127.0.0.1';
+  }
+  if (host.includes(':') && !host.startsWith('[')) {
+    host = `[${host}]`;
+  }
+  return `http://${host}:${port}`;
+}
+
 function readConfiguration() {
-  const controlToken = process.env.PS_TUNNEL_CONTROL_TOKEN;
+  const configuredServerConfigPath = nonEmptyEnvironmentValue('PS_TUNNEL_SERVER_CONFIG_PATH');
+  const serverConfigPath = path.resolve(configuredServerConfigPath || DEFAULT_SERVER_CONFIG_PATH);
+  const serverConfiguration = readServerConfigurationFile(serverConfigPath, configuredServerConfigPath !== null);
+
+  const controlToken = nonEmptyEnvironmentValue('PS_TUNNEL_CONTROL_TOKEN')
+    || (typeof serverConfiguration?.controlToken === 'string' ? serverConfiguration.controlToken : null);
   if (typeof controlToken !== 'string' || controlToken.length < 16) {
-    throw new Error('PS_TUNNEL_CONTROL_TOKEN must contain at least 16 characters.');
+    throw new Error('Control token must be provided by PS_TUNNEL_CONTROL_TOKEN or the local server config.');
   }
 
-  const configuredBaseUri = process.env.PS_TUNNEL_CONTROL_BASE_URI;
-  const controlBaseUri = (configuredBaseUri && configuredBaseUri.trim()) || DEFAULT_CONTROL_BASE_URI;
+  const configuredBaseUri = nonEmptyEnvironmentValue('PS_TUNNEL_CONTROL_BASE_URI');
+  const controlBaseUri = configuredBaseUri
+    || controlBaseUriFromServerConfig(serverConfiguration)
+    || DEFAULT_CONTROL_BASE_URI;
   const parsedBaseUri = new URL(controlBaseUri);
   if (parsedBaseUri.protocol !== 'http:' && parsedBaseUri.protocol !== 'https:') {
     throw new Error('PS_TUNNEL_CONTROL_BASE_URI must use http or https.');
@@ -24,7 +102,159 @@ function readConfiguration() {
   return {
     controlToken,
     controlBaseUri: parsedBaseUri.href.replace(/\/$/, ''),
+    parsedControlBaseUri: parsedBaseUri,
+    serverConfigPath,
+    autoStartLocalServer: readBooleanEnvironment('PS_TUNNEL_AUTO_START', true),
+    powerShellPath: nonEmptyEnvironmentValue('PS_TUNNEL_POWERSHELL_PATH') || 'powershell.exe',
+    serverStartTimeoutMilliseconds: readPositiveIntegerEnvironment(
+      'PS_TUNNEL_SERVER_START_TIMEOUT_MS',
+      DEFAULT_SERVER_START_TIMEOUT_MS,
+    ),
   };
+}
+
+function isLoopbackControlUri(parsedBaseUri) {
+  const hostname = parsedBaseUri.hostname.toLowerCase();
+  return hostname === 'localhost' || hostname === '::1' || hostname.startsWith('127.');
+}
+
+async function probeControlApi(configuration) {
+  const controller = new AbortController();
+  const timeout = setTimeout(
+    () => controller.abort(new Error('Control API probe timed out.')),
+    CONTROL_PROBE_TIMEOUT_MS,
+  );
+  try {
+    const response = await fetch(`${configuration.controlBaseUri}/v1/status`, {
+      headers: {
+        Authorization: `Bearer ${configuration.controlToken}`,
+        Accept: 'application/json',
+      },
+      signal: controller.signal,
+    });
+    return {
+      reachable: true,
+      authenticated: response.ok,
+      status: response.status,
+      statusText: response.statusText,
+    };
+  } catch (error) {
+    return {
+      reachable: false,
+      authenticated: false,
+      error,
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function appendLimited(current, chunk) {
+  const maximumLength = 65536;
+  const combined = current + chunk.toString('utf8');
+  return combined.length <= maximumLength ? combined : combined.slice(combined.length - maximumLength);
+}
+
+async function startLocalServer(configuration) {
+  const startScriptPath = path.join(MODULE_DIRECTORY, 'start.ps1');
+  if (!fs.existsSync(startScriptPath)) {
+    throw new Error(`PS Tunnel start script was not found: ${startScriptPath}`);
+  }
+  if (!fs.existsSync(configuration.serverConfigPath)) {
+    throw new Error(`PS Tunnel server config was not found: ${configuration.serverConfigPath}`);
+  }
+
+  await new Promise((resolve, reject) => {
+    const child = spawn(configuration.powerShellPath, [
+      '-NoLogo',
+      '-NoProfile',
+      '-NonInteractive',
+      '-ExecutionPolicy',
+      'Bypass',
+      '-File',
+      startScriptPath,
+      '-ConfigPath',
+      configuration.serverConfigPath,
+    ], {
+      cwd: MODULE_DIRECTORY,
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let standardOutput = '';
+    let standardError = '';
+    let settled = false;
+    const timeout = setTimeout(() => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      child.kill();
+      child.stdout.destroy();
+      child.stderr.destroy();
+      reject(new Error(
+        `PS Tunnel server startup exceeded ${configuration.serverStartTimeoutMilliseconds} ms.`,
+      ));
+    }, configuration.serverStartTimeoutMilliseconds);
+
+    child.stdout.on('data', chunk => {
+      standardOutput = appendLimited(standardOutput, chunk);
+    });
+    child.stderr.on('data', chunk => {
+      standardError = appendLimited(standardError, chunk);
+    });
+    child.once('error', error => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timeout);
+      child.stdout.destroy();
+      child.stderr.destroy();
+      reject(new Error(`Could not launch PS Tunnel start script: ${error.message}`));
+    });
+    child.once('exit', code => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timeout);
+      child.stdout.destroy();
+      child.stderr.destroy();
+      if (code !== 0) {
+        const detail = standardError.trim() || standardOutput.trim() || `exit code ${code}`;
+        reject(new Error(`PS Tunnel server startup failed: ${detail}`));
+        return;
+      }
+      resolve();
+    });
+  });
+}
+
+async function ensureLocalServer(configuration) {
+  const initialProbe = await probeControlApi(configuration);
+  if (initialProbe.authenticated) {
+    return;
+  }
+  if (initialProbe.reachable) {
+    throw new Error(
+      `PS Tunnel control API rejected the configured credentials with HTTP ${initialProbe.status}.`,
+    );
+  }
+  if (!configuration.autoStartLocalServer || !isLoopbackControlUri(configuration.parsedControlBaseUri)) {
+    return;
+  }
+
+  await startLocalServer(configuration);
+  const readyProbe = await probeControlApi(configuration);
+  if (!readyProbe.authenticated) {
+    if (readyProbe.reachable) {
+      throw new Error(
+        `PS Tunnel control API rejected the configured credentials with HTTP ${readyProbe.status}.`,
+      );
+    }
+    throw new Error(`PS Tunnel control API is unavailable after startup at ${configuration.controlBaseUri}.`);
+  }
+  console.error(`PS Tunnel MCP started local services using ${configuration.serverConfigPath}.`);
 }
 
 function createRequestSignal(parentSignal, timeoutMilliseconds) {
@@ -218,8 +448,7 @@ const scriptSchema = z.string().describe('Complete PowerShell script to execute 
 const timeoutSchema = z.number().int().min(1).max(3600).default(30)
   .describe('Client-side PowerShell execution timeout in seconds.');
 
-function createServer() {
-  const configuration = readConfiguration();
+function createServer(configuration = readConfiguration()) {
   const server = new McpServer(
     { name: 'ps-tunnel', version: SERVER_VERSION },
     {
@@ -334,14 +563,18 @@ function createServer() {
   return server;
 }
 
-try {
-  serveStdio(createServer, {
+async function main() {
+  const configuration = readConfiguration();
+  await ensureLocalServer(configuration);
+  serveStdio(() => createServer(configuration), {
     onerror(error) {
       console.error(`PS Tunnel MCP transport error: ${error.message}`);
     },
   });
   console.error(`PS Tunnel MCP ${SERVER_VERSION} running on stdio.`);
-} catch (error) {
+}
+
+main().catch(error => {
   console.error(`PS Tunnel MCP failed to start: ${error.message}`);
   process.exitCode = 1;
-}
+});
