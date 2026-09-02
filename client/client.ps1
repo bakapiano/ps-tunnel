@@ -375,6 +375,64 @@ function ConvertTo-StringKeyHashtable {
     return $result
 }
 
+function ConvertTo-StrictJsonText {
+    param([Parameter(Mandatory = $true)][string]$Json)
+
+    # Windows PowerShell 5.1 emits bare NaN/Infinity tokens from ConvertTo-Json.
+    # Those tokens are valid JavaScript literals but invalid JSON, so replace
+    # them only while outside quoted strings.
+    $builder = New-Object System.Text.StringBuilder($Json.Length)
+    $inString = $false
+    $escaped = $false
+    $index = 0
+    while ($index -lt $Json.Length) {
+        $character = $Json[$index]
+        if ($inString) {
+            [void]$builder.Append($character)
+            if ($escaped) {
+                $escaped = $false
+            }
+            elseif ($character -eq '\') {
+                $escaped = $true
+            }
+            elseif ($character -eq '"') {
+                $inString = $false
+            }
+            $index++
+            continue
+        }
+
+        if ($character -eq '"') {
+            $inString = $true
+            [void]$builder.Append($character)
+            $index++
+            continue
+        }
+
+        $matchedLength = 0
+        foreach ($token in @('-Infinity', 'Infinity', 'NaN')) {
+            if (
+                ($index + $token.Length) -le $Json.Length -and
+                [string]::CompareOrdinal($Json, $index, $token, 0, $token.Length) -eq 0
+            ) {
+                $matchedLength = $token.Length
+                break
+            }
+        }
+        if ($matchedLength -gt 0) {
+            [void]$builder.Append('null')
+            $index += $matchedLength
+            continue
+        }
+
+        [void]$builder.Append($character)
+        $index++
+    }
+    return $builder.ToString()
+}
+
+$StrictJsonNormalizerSource = ${function:ConvertTo-StrictJsonText}.ToString()
+
 $AllowedTaskScript = {
     param(
         [string]$Action,
@@ -487,6 +545,10 @@ $TaskWorkerScript = {
 
     try {
         $json = $result | ConvertTo-Json -Compress -Depth 16
+        if ($null -ne $payload -and -not [string]::IsNullOrWhiteSpace([string]$payload.strictJsonNormalizerSource)) {
+            $normalizer = [scriptblock]::Create([string]$payload.strictJsonNormalizerSource)
+            $json = & $normalizer -Json $json
+        }
     }
     catch {
         $result = [ordered]@{
@@ -552,6 +614,7 @@ function Start-AllowedTaskWorker {
             action = $Action
             arguments = $Arguments
             allowedTaskScript = $AllowedTaskScript.ToString()
+            strictJsonNormalizerSource = $StrictJsonNormalizerSource
             maxResultBytes = [Math]::Max(512, $MaxMessageBytes - 4096)
         }
         $payloadJson = $payload | ConvertTo-Json -Compress -Depth 16
@@ -703,6 +766,7 @@ function Send-ProtocolMessage {
     )
 
     $json = $Message | ConvertTo-Json -Compress -Depth 16
+    $json = ConvertTo-StrictJsonText -Json $json
     $size = [System.Text.Encoding]::UTF8.GetByteCount($json)
     if ($size -gt $MaxMessageBytes) {
         throw ('Protocol message is {0} bytes; limit is {1}.' -f $size, $MaxMessageBytes)

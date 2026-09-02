@@ -274,6 +274,29 @@ try {
     Assert-True ([int]$powerShellResult.result.output.total -eq 10) 'powershell task should execute variables and pipelines'
     Assert-True (-not [string]::IsNullOrWhiteSpace([string]$powerShellResult.result.output.runtime)) 'powershell task should expose its runtime version'
 
+    $nonFiniteScript = @'
+[pscustomobject]@{
+    positiveInfinity = [double]::PositiveInfinity
+    negativeInfinity = [double]::NegativeInfinity
+    notANumber = [double]::NaN
+    finite = 42.5
+    literal = 'Infinity inside a JSON string stays text'
+    nested = @([pscustomobject]@{ x = [double]::PositiveInfinity; label = 'NaN' })
+}
+'@
+    $nonFiniteTask = Invoke-TestApi -Method POST -Path '/v1/tasks' -Body @{
+        agentId = 'agent-a'; action = 'powershell'; args = @{ script = $nonFiniteScript }; timeoutSeconds = 10
+    }
+    $nonFiniteResult = Wait-Task -TaskId $nonFiniteTask.id
+    Assert-True ($nonFiniteResult.status -eq 'succeeded') 'non-finite PowerShell output should produce a valid task result'
+    Assert-True ([double]$nonFiniteResult.result.output.finite -eq 42.5) 'finite numeric output should remain numeric'
+    Assert-True ($nonFiniteResult.result.output.literal -eq 'Infinity inside a JSON string stays text') 'normalization should preserve Infinity inside strings'
+    Assert-True ($nonFiniteResult.result.output.nested[0].label -eq 'NaN') 'normalization should preserve NaN inside nested strings'
+    $nonFiniteStatus = Invoke-TestApi -Method GET -Path '/v1/status' -Body $null
+    $nonFiniteAgent = @($nonFiniteStatus.agents | Where-Object { $_.agentId -eq 'agent-a' })[0]
+    Assert-True ($nonFiniteAgent.connected -eq $true) 'agent should remain connected after non-finite output'
+    Assert-True ([string]$nonFiniteAgent.sessionId -eq $firstSessionId) 'non-finite output should preserve the authenticated session'
+
     $heartbeatSessionBefore = Invoke-TestApi -Method GET -Path '/v1/status' -Body $null
     $heartbeatSessionId = [string](@($heartbeatSessionBefore.agents | Where-Object { $_.agentId -eq 'agent-a' })[0].sessionId)
     $parallelMarkerA = 'parallel-a-{0}' -f [Guid]::NewGuid().ToString('N')
