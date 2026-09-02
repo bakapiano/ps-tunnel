@@ -1,8 +1,10 @@
+**English** | [简体中文](README.zh-CN.md)
+
 # PS Tunnel
 
-PS Tunnel 是一个用于**已授权 Windows 设备管理**的出站任务通道。受管端 A 只需要 PowerShell 5.1+ 和 Windows OpenSSH 客户端 `ssh.exe`；管理端 B 运行 Node.js 服务并监听 SSH 端口。
+PS Tunnel is an outbound task channel for **authorized administration of Windows devices**. Managed endpoint A needs only PowerShell 5.1+ and the Windows OpenSSH client (`ssh.exe`). Management endpoint B runs the Node.js services and listens for SSH connections.
 
-A 主动连接 B，因此 A 无需监听端口，也无需安装 `sshd`。传输由 SSH 加密，SSH 公钥认证后，协议层再用独立 Agent Secret 完成 HMAC-SHA256 双向挑战应答。
+A initiates the connection to B, so A runs only an outbound SSH client. SSH encrypts the transport; after SSH public-key authentication, the application protocol performs a separate mutual HMAC-SHA256 challenge-response using an Agent Secret.
 
 ```text
 Codex / Claude Code / GitHub Copilot
@@ -14,78 +16,78 @@ B: ctl.ps1 ---------------------------+-> 127.0.0.1:8766 -> broker.js
 A: client.ps1 -------------------------> SSH :2222 -> ssh-server.js
 ```
 
-## 安全模型
+## Security model
 
-- SSH 入口只接受配置中的用户名和 Ed25519 公钥。
-- SSH 会话只能桥接到 B 本机回环地址上的 Broker。
-- TTY、环境变量、X11 和额外 SSH 会话请求会被拒绝。
-- Agent 使用独立 Secret 做 HMAC-SHA256 双向认证。
-- 控制 API 只绑定 `127.0.0.1`，并要求独立 Bearer Token。
-- MCP server 由 AI 客户端通过 stdio 启动，并使用环境变量中的控制令牌访问回环控制 API。
-- A 使用 `StrictHostKeyChecking=yes` 固定校验 B 的 SSH host key。
-- 客户端采用带抖动的指数退避自动重连。
-- 客户端通过非阻塞事件循环持续处理心跳，每条任务在独立 PowerShell worker 中运行并转换结果。
-- 同一 Agent 默认并行执行 4 条任务；多个 MCP/CLI 实例共享 Broker，可同时提交并等待各自的 PowerShell 命令。
-- 任务动作包括 `ping`、`echo`、`get_host_info` 和可执行任意脚本内容的 `powershell`。
+- The SSH entry point accepts only the configured username and Ed25519 public key.
+- Each SSH session can bridge only to the Broker on B's loopback interface.
+- TTY, environment-variable, X11, and additional SSH session requests are rejected.
+- Each Agent uses an independent secret for mutual HMAC-SHA256 authentication.
+- The control API binds to `127.0.0.1` and requires a separate Bearer Token.
+- AI clients start the MCP server over stdio; the MCP server uses the control token to access the loopback control API.
+- A pins B's SSH host key with `StrictHostKeyChecking=yes`.
+- The client reconnects automatically with jittered exponential backoff.
+- A non-blocking client event loop keeps heartbeats flowing while every task runs and serializes its result in a separate PowerShell worker.
+- One Agent executes four tasks concurrently by default. Multiple MCP/CLI instances share the Broker and can submit and await independent PowerShell commands at the same time.
+- Task actions include `ping`, `echo`, `get_host_info`, and `powershell`, which can execute arbitrary PowerShell script content.
 
-该设计面向明确授权的设备。请按组织安全策略保存、分发和轮换密钥。
+This design targets explicitly authorized devices. Store, distribute, and rotate keys according to your organization's security policy.
 
-## 目录
+## Repository layout
 
 ```text
 mcp-config/
-  codex.config.toml             Codex 用户配置示例
-  claude.mcp.json               Claude Code 项目配置示例
-  github-copilot.mcp.json       GitHub Copilot / VS Code 配置示例
+  codex.config.toml             Codex user configuration example
+  claude.mcp.json               Claude Code project configuration example
+  github-copilot.mcp.json       GitHub Copilot / VS Code configuration example
 client/
-  client.ps1          A 上运行的 PowerShell 5.1/7 客户端
+  client.ps1                    PowerShell 5.1/7 client that runs on A
 server/
-  broker.js           Agent 会话、任务队列和本地控制 API
-  mcp-server.mjs      标准 stdio MCP server
-  mcp-smoke.mjs       官方 MCP SDK client 全链路测试
-  mcp-autostart-e2e.ps1 MCP 自动启动与隔离 Codex 模型测试
-  ssh-server.js       基于 ssh2 的受限 SSH 监听器
-  session.js          协议 E2E 使用的本地进程桥
-  start.ps1           启动或检查 B 端进程
-  ctl.ps1             B 本机控制命令
-  config.example.json 配置模板
-  e2e.ps1             认证、MCP、任务和断线重连 E2E
+  broker.js                     Agent sessions, task queue, and local control API
+  mcp-server.mjs                Standard stdio MCP server
+  mcp-smoke.mjs                 Official MCP SDK end-to-end client test
+  mcp-autostart-e2e.ps1         MCP auto-start and isolated Codex model test
+  ssh-server.js                 Restricted SSH listener built on ssh2
+  session.js                    Local process bridge used by protocol E2E tests
+  start.ps1                     Starts or checks the B-side processes
+  ctl.ps1                       Local B-side control command
+  config.example.json           Configuration template
+  e2e.ps1                       Authentication, MCP, task, and reconnect E2E test
 ```
 
-运行时配置、私钥、公钥、`known_hosts`、状态、日志和 `node_modules` 均已加入 `.gitignore`。
+Runtime configuration, private and public keys, `known_hosts`, state, logs, and `node_modules` are covered by `.gitignore`.
 
-## 前置条件
+## Prerequisites
 
-### A：受管 Windows 设备
+### A: managed Windows endpoint
 
-- Windows PowerShell 5.1 或 PowerShell 7
-- Windows OpenSSH 客户端
+- Windows PowerShell 5.1 or PowerShell 7
+- Windows OpenSSH client
 
-检查：
+Check:
 
 ```powershell
 Get-Command powershell.exe, ssh.exe, ssh-keygen.exe
 ```
 
-### B：管理端 Windows 设备
+### B: management Windows endpoint
 
 - Node.js 20+
-- PowerShell 5.1 或 PowerShell 7
-- Windows OpenSSH 客户端，用于生成密钥
-- 管理员权限，仅用于创建入站防火墙规则
+- Windows PowerShell 5.1 or PowerShell 7
+- Windows OpenSSH client for key generation
+- Administrator access only when creating the inbound firewall rule
 
-检查：
+Check:
 
 ```powershell
 node --version
 Get-Command node.exe, ssh.exe, ssh-keygen.exe
 ```
 
-## 部署 B
+## Deploy B
 
-以下命令在仓库根目录执行。
+Run the following commands from the repository root.
 
-### 1. 安装依赖
+### 1. Install dependencies
 
 ```powershell
 Set-Location .\server
@@ -93,9 +95,9 @@ npm ci --ignore-scripts --omit=dev --no-audit --no-fund
 Copy-Item .\config.example.json .\config.json
 ```
 
-`ssh2` 可以使用纯 JavaScript 后备实现，因此受控环境中可使用 `--ignore-scripts` 跳过可选原生模块编译。
+`ssh2` has a pure-JavaScript fallback, so controlled environments can use `--ignore-scripts` to skip optional native-module compilation.
 
-### 2. 生成独立 Secret
+### 2. Generate independent secrets
 
 ```powershell
 function New-RandomSecret {
@@ -117,21 +119,22 @@ $json = $config | ConvertTo-Json -Depth 10
 )
 ```
 
-`controlToken` 只用于 B 本机控制 API；`agents.agent-a` 只用于 A 与 Broker 的应用层认证。两者应保持独立。
-`maxConcurrentTasksPerAgent` 控制 Broker 向每个在线 Agent 同时派发的任务数，模板默认值为 `4`。
+`controlToken` is used only by B's local control API. `agents.agent-a` is used only for application-layer authentication between A and the Broker. Keep them independent.
 
-### 3. 生成 SSH host key 和 Agent key
+`maxConcurrentTasksPerAgent` controls how many tasks the Broker dispatches concurrently to each online Agent. The template defaults to `4`.
 
-首次部署分别执行下面两条命令：
+### 3. Generate the SSH host key and Agent key
+
+Run both commands once during the initial deployment:
 
 ```powershell
 ssh-keygen.exe -t ed25519 -C 'ps-tunnel-host' -f .\ssh-host-ed25519
 ssh-keygen.exe -t ed25519 -C 'ps-tunnel-agent-a' -f .\agent-a-ed25519
 ```
 
-两次命令都在 passphrase 提示处直接按 Enter。B 的监听器需要无人值守读取 host 私钥，A 的客户端需要无人值守断线重连。文件 ACL 和独立 Agent Secret 提供额外保护。
+Press Enter at both passphrase prompts. The B listener needs unattended access to its host private key, and the A client needs unattended reconnection. File ACLs and the independent Agent Secret provide additional protection.
 
-收紧 B 上 host 私钥的 ACL：
+Restrict the host private-key ACL on B:
 
 ```powershell
 $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
@@ -140,9 +143,9 @@ icacls.exe $hostKey /inheritance:r
 icacls.exe $hostKey /grant:r "${me}:(R)" 'SYSTEM:(R)'
 ```
 
-### 4. 为 A 创建固定 host key 文件
+### 4. Create A's pinned host-key file
 
-把 `<B_ADDRESS>` 替换为 A 实际连接 B 时使用的 IPv4 地址或 DNS 名称：
+Replace `<B_ADDRESS>` with the IPv4 address or DNS name that A actually uses to reach B:
 
 ```powershell
 $BAddress = '<B_ADDRESS>'
@@ -154,27 +157,27 @@ $hostPublicKey = ((Get-Content .\ssh-host-ed25519.pub -Raw).Trim() -split '\s+')
 ssh-keygen.exe -lf .\known_hosts-a
 ```
 
-自定义端口的 `known_hosts` 主机字段必须使用 `[host]:port` 格式。
+For a custom port, the host field in `known_hosts` must use the `[host]:port` format.
 
-### 5. 启动 B
+### 5. Start B
 
 ```powershell
 .\start.ps1
 ```
 
-脚本会启动或检查以下监听器：
+The script starts or checks these listeners:
 
-- `127.0.0.1:8765`：Agent Broker
-- `127.0.0.1:8766`：控制 API
-- `0.0.0.0:2222`：受限 SSH 入口
+- `127.0.0.1:8765`: Agent Broker
+- `127.0.0.1:8766`: control API
+- `0.0.0.0:2222`: restricted SSH entry point
 
-启动日志写入 `server` 目录并由 Git 忽略。再次运行 `start.ps1` 会检查端口是否由预期进程占用。
+Startup logs are written under `server` and ignored by Git. Running `start.ps1` again verifies that the expected processes own the ports.
 
-这也是独立运行 B 服务的入口。配置 MCP 后，AI 客户端启动 stdio MCP 时会自动执行同一检查和启动流程。
+This is also the entry point for running B independently. After MCP configuration, starting the stdio MCP server performs the same check and starts these services automatically.
 
-### 6. 创建 B 的防火墙规则
+### 6. Create B's firewall rule
 
-在 B 的管理员 PowerShell 中执行：
+Run this in an elevated PowerShell session on B:
 
 ```powershell
 $ruleName = 'PS-Tunnel-SSH-In-TCP'
@@ -192,13 +195,13 @@ if (-not (Get-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue)) {
 }
 ```
 
-根据实际网络边界调整 `RemoteAddress` 和 Profile。Broker 的 8765、8766 继续只监听回环地址。
+Adjust `RemoteAddress` and the firewall profile for your network boundary. Ports 8765 and 8766 remain bound to the loopback interface.
 
-## 部署 A
+## Deploy A
 
-### 1. 复制三个文件
+### 1. Copy three files
 
-在 A 创建固定目录 `C:\ps_tunnel`，然后通过获批的文件传输方式复制：
+Create `C:\ps_tunnel` on A, then use an approved file-transfer method to copy:
 
 ```text
 client/client.ps1        -> C:\ps_tunnel\client.ps1
@@ -206,9 +209,9 @@ server/agent-a-ed25519   -> C:\ps_tunnel\agent-a-ed25519
 server/known_hosts-a     -> C:\ps_tunnel\known_hosts-a
 ```
 
-Agent 公钥留在 B 的 `server/agent-a-ed25519.pub`，Agent 私钥放在 A。
+Keep the Agent public key on B at `server/agent-a-ed25519.pub` and place the Agent private key on A.
 
-### 2. 收紧 A 上私钥 ACL
+### 2. Restrict the private-key ACL on A
 
 ```powershell
 $key = 'C:\ps_tunnel\agent-a-ed25519'
@@ -217,13 +220,13 @@ $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
 icacls.exe $key /inheritance:r
 icacls.exe $key /grant:r "${me}:(R)" 'SYSTEM:(R)'
 
-# 验证当前账户能够读取私钥，并显示它对应的公钥指纹
+# Verify that the current account can read the key and show its public-key fingerprint.
 ssh-keygen.exe -y -f $key | ssh-keygen.exe -lf -
 ```
 
-### 3. 启动客户端
+### 3. Start the client
 
-通过安全渠道把 `config.json` 中 `agents.agent-a` 的值交给 A，然后执行：
+Transfer the value of `agents.agent-a` from `config.json` to A over a secure channel, then run:
 
 ```powershell
 Set-Location 'C:\ps_tunnel'
@@ -243,27 +246,27 @@ $env:PS_TUNNEL_AGENT_SECRET = '<AGENT_SECRET>'
     -ReconnectMaxSeconds 30
 ```
 
-看到 `Authenticated session ...` 表示 A 已在线。网络或 B 重启后，客户端会持续重连。
+`Authenticated session ...` means that A is online. The client keeps reconnecting after network interruptions or a restart of B.
 
-首次在交互终端认证成功后，客户端会询问：
+After the first successful authentication in an interactive terminal, the client asks:
 
 ```text
 Connection authenticated. Create a one-click start-client.ps1 with these settings? [y/N]
 ```
 
-输入 `y` 会在 `client.ps1` 旁生成 `start-client.ps1`。生成器会保存本次全部有效连接、超时和重连参数；Agent Secret 使用 Windows DPAPI 的 .NET API 加密，因此启动脚本只可由创建它的同一台计算机、同一 Windows 用户解密。文件 ACL 会收紧到当前用户和 `SYSTEM`。
+Entering `y` generates `start-client.ps1` next to `client.ps1`. The generator stores all effective connection, timeout, and reconnect parameters. It protects the Agent Secret with the Windows DPAPI .NET API, so only the same Windows user on the same computer can decrypt the launcher. The file ACL is restricted to the current user and `SYSTEM`.
 
-以后可以一键运行：
+Future launches take one command:
 
 ```powershell
 & 'C:\ps_tunnel\start-client.ps1'
 ```
 
-启动脚本会传入 `LauncherMode=Never`，因此不会再次询问。自动化场景也可在原始命令中使用 `-LauncherMode Never`；需要直接生成时可使用 `-LauncherMode Always -LauncherPath <path.ps1>`。
+The launcher passes `LauncherMode=Never` and therefore runs directly. Automation can also add `-LauncherMode Never` to the original command. Use `-LauncherMode Always -LauncherPath <path.ps1>` to generate a launcher immediately.
 
-## 在 B 上提交任务
+## Submit tasks on B
 
-从本机配置读取控制令牌：
+Load the control token from the local configuration:
 
 ```powershell
 Set-Location '<REPOSITORY_ROOT>'
@@ -288,32 +291,35 @@ $services = Get-Service | Where-Object Status -eq 'Running'
     -PowerShellScript $script -TaskTimeoutSeconds 30 -Wait
 ```
 
-`get_host_info` 返回计算机名、当前用户、PowerShell 版本、进程 ID、工作目录和时间。
-`powershell` 在客户端的独立 PowerShell worker 进程中执行 `args.script`，并把管道输出作为任务结果返回；也可以通过 `-ArgumentsJson '{"script":"Get-Date"}'` 提交。worker 执行、结果转换和超时终止均与主协议事件循环隔离。client 在认证时声明 `-MaxConcurrentTasks`，Broker 使用它与 `maxConcurrentTasksPerAgent` 中的较小值；旧版 client 自动按单任务会话处理。
+`get_host_info` returns the computer name, current user, PowerShell version, process ID, working directory, and time.
 
-## 通过 MCP 使用
+`powershell` executes `args.script` in a separate PowerShell worker on the client and returns the pipeline output as the task result. You can also submit `-ArgumentsJson '{"script":"Get-Date"}'`. Worker execution, result conversion, and timeout termination remain isolated from the main protocol event loop. Before transport, the client normalizes bare `NaN` and `Infinity` tokens emitted by Windows PowerShell 5.1 into strict JSON.
 
-项目提供标准 stdio MCP server，并注册四个 tools：
+During authentication, the client advertises `-MaxConcurrentTasks`. The Broker uses the lower value between that setting and `maxConcurrentTasksPerAgent`. Older clients automatically run as single-task sessions.
 
-- `list_agents`：列出 Agent 和连接状态。
-- `run_powershell`：提交 PowerShell 并等待完整结果。
-- `submit_powershell`：提交 PowerShell 并立即返回 task ID。
-- `get_task`：按 task ID 查询状态和完整结果。
+## Use through MCP
 
-MCP server 默认读取自身同目录的 `config.json`，从中获取控制令牌和控制 API 地址。stdio MCP 启动时会先认证探测控制 API；本机回环服务尚未就绪时，它会静默执行 `start.ps1`，等 Broker 和 SSH 监听器就绪后再开始 MCP 协议通信。重复启动会复用已经就绪的进程。
+The project provides a standard stdio MCP server with four tools:
 
-Codex、Claude Code、GitHub Copilot CLI 等工具各自启动独立 stdio MCP 进程；这些进程连接同一个回环控制 API 和 Broker。来自多个 CLI/MCP 会话的任务会进入同一队列，并按 Agent 的并发配置同时派发。
+- `list_agents`: list Agents and connection state.
+- `run_powershell`: submit PowerShell and wait for the complete result.
+- `submit_powershell`: submit PowerShell and immediately return a task ID.
+- `get_task`: retrieve task state and the complete result by task ID.
 
-标准部署只需让 AI 客户端执行 `server/mcp-server.mjs`。以下环境变量用于自定义部署：
+By default, the MCP server reads `config.json` from its own directory to obtain the control token and control API address. At stdio startup, it authenticates to and probes the control API. When the loopback services need startup, it silently runs `start.ps1`, waits for the Broker and SSH listener, and then starts the MCP protocol. Repeated launches reuse healthy processes.
 
-- `PS_TUNNEL_SERVER_CONFIG_PATH`：指定另一份 server 配置文件。
-- `PS_TUNNEL_CONTROL_TOKEN`：覆盖配置文件中的控制令牌。
-- `PS_TUNNEL_CONTROL_BASE_URI`：覆盖配置文件推导出的控制 API 地址。
-- `PS_TUNNEL_AUTO_START`：设置为 `true` 或 `false`，默认 `true`。
-- `PS_TUNNEL_POWERSHELL_PATH`：指定执行 `start.ps1` 的 PowerShell。
-- `PS_TUNNEL_SERVER_START_TIMEOUT_MS`：启动等待时间，默认 45000 毫秒。
+Codex, Claude Code, GitHub Copilot CLI, and other clients each start an independent stdio MCP process. These processes connect to the same loopback control API and Broker. Tasks from multiple CLI/MCP sessions enter one queue and are dispatched concurrently according to the Agent configuration.
 
-例如，使用另一份隔离配置：
+A standard deployment only needs the AI client to execute `server/mcp-server.mjs`. These environment variables customize the deployment:
+
+- `PS_TUNNEL_SERVER_CONFIG_PATH`: use another server configuration file.
+- `PS_TUNNEL_CONTROL_TOKEN`: override the control token from the configuration.
+- `PS_TUNNEL_CONTROL_BASE_URI`: override the control API address derived from the configuration.
+- `PS_TUNNEL_AUTO_START`: `true` or `false`; defaults to `true`.
+- `PS_TUNNEL_POWERSHELL_PATH`: select the PowerShell executable for `start.ps1`.
+- `PS_TUNNEL_SERVER_START_TIMEOUT_MS`: startup wait time in milliseconds; defaults to 45000.
+
+For example, to use an isolated configuration:
 
 ```powershell
 Set-Location '<REPOSITORY_ROOT>'
@@ -322,24 +328,24 @@ $env:PS_TUNNEL_SERVER_CONFIG_PATH = 'C:\ps-tunnel-test\config.json'
 
 ### Codex
 
-将 `mcp-config/codex.config.toml` 中的路径替换为仓库绝对路径，再把配置段合并到用户级 `$HOME/.codex/config.toml`：
+Replace the paths in `mcp-config/codex.config.toml` with absolute repository paths, then merge the configuration into the user-level `$HOME/.codex/config.toml`:
 
 ```powershell
 codex mcp list
 codex
 ```
 
-新会话中可以直接要求模型：
+In a new session, you can ask the model:
 
 ```text
-使用 ps_tunnel MCP，先列出 Agent，再在 agent-a 执行：Get-Date
+Use the ps_tunnel MCP. List the Agents first, then run Get-Date on agent-a.
 ```
 
-Codex CLI、IDE 扩展和桌面端共用 MCP 配置，具体配置项见 [OpenAI Docs](https://learn.chatgpt.com/docs/extend/mcp?surface=cli)。
+Codex CLI, IDE extensions, and the desktop app share the MCP configuration. See [OpenAI Docs](https://learn.chatgpt.com/docs/extend/mcp?surface=cli) for configuration details.
 
 ### Claude Code
 
-把 `mcp-config/claude.mcp.json` 的内容合并到需要启用 MCP 的项目级 `.mcp.json`：
+Merge `mcp-config/claude.mcp.json` into the project-level `.mcp.json` for each project that should use the MCP server:
 
 ```powershell
 claude mcp list
@@ -348,19 +354,19 @@ claude
 
 ### GitHub Copilot
 
-把 `mcp-config/github-copilot.mcp.json` 的内容合并到需要启用 MCP 的工作区级 `.vscode/mcp.json`。打开该工作区后，在 Copilot Chat 的工具列表中启用 `ps_tunnel` tools，即可从 Agent 模式调用。
+Merge `mcp-config/github-copilot.mcp.json` into the workspace-level `.vscode/mcp.json`. Open that workspace and enable the `ps_tunnel` tools in the Copilot Chat tool list to call them from Agent mode.
 
-这三份文件位于纯示例目录，当前仓库不会自动加载 MCP 配置。AI 客户端加载配置后会负责启动 stdio MCP，MCP 再负责确保本地 PS Tunnel 服务就绪。
+The three files under `mcp-config` are examples and are not loaded automatically by this repository. After an AI client loads its configuration, it starts the stdio MCP process, and MCP ensures that the local PS Tunnel services are ready.
 
-## 踩坑与诊断
+## Troubleshooting
 
-### A 只有 `ssh.exe`
+### A has only `ssh.exe`
 
-这是预期部署形态。A 是出站 SSH 客户端，监听器位于 B。`Get-Service sshd` 在 A 上没有结果不会影响客户端运行。
+This is the expected deployment shape. A is the outbound SSH client, and the listener runs on B. The client operates independently of an `sshd` service on A.
 
-### 指定的私钥没有被 SSH 提交
+### SSH does not offer the specified private key
 
-客户端固定传入：
+The client always passes:
 
 ```text
 -o BatchMode=yes
@@ -368,40 +374,40 @@ claude
 -i <identity-file>
 ```
 
-`IdentitiesOnly=yes` 可以避免 SSH Agent、默认密钥和配置文件干扰显式指定的密钥。用下面的命令确认私钥可读：
+`IdentitiesOnly=yes` prevents SSH Agent, default keys, and SSH configuration from interfering with the explicitly selected key. Confirm that the private key is readable:
 
 ```powershell
 ssh-keygen.exe -y -f C:\ps_tunnel\agent-a-ed25519 | ssh-keygen.exe -lf -
 ```
 
-### Windows OpenSSH 拒绝私钥权限
+### Windows OpenSSH rejects the private-key permissions
 
-典型现象是 `UNPROTECTED PRIVATE KEY FILE`、`Permissions ... are too open` 或私钥未被采用。移除继承 ACL，只授予运行客户端的账户和 `SYSTEM` 读取权限，然后再次执行 `ssh-keygen -y`。
+Typical messages include `UNPROTECTED PRIVATE KEY FILE`, `Permissions ... are too open`, or a key that is skipped. Remove inherited ACLs, grant read access only to the client account and `SYSTEM`, and run `ssh-keygen -y` again.
 
-### `known_hosts` 看起来正确，但主机校验仍失败
+### `known_hosts` looks correct but host verification fails
 
-端口 2222 对应的行必须以 `[B_ADDRESS]:2222` 开头。确认 A 使用的地址与生成文件时完全一致，并检查指纹：
+The line for port 2222 must start with `[B_ADDRESS]:2222`. Confirm that A uses exactly the address recorded in the file, then inspect the fingerprint:
 
 ```powershell
 ssh-keygen.exe -lf C:\ps_tunnel\known_hosts-a
 ```
 
-主机密钥变化时，应先通过可信渠道核验 B 的新指纹，再替换固定记录。
+When the host key changes, verify B's new fingerprint through a trusted channel before replacing the pinned entry.
 
-### 手工 SSH 已认证，随后收到协议错误
+### Manual SSH authenticates and then reports a protocol error
 
-直接运行 SSH 会先看到 Broker 发出的 `challenge`。向 SSH 管道写入 `{}` 会关闭标准输入，Broker 会返回 `Expected authenticate message`；这说明 SSH、公钥和 Broker 链路已经连通，但输入不是完整 HMAC 协议。正式客户端会保持标准输入开启并完成挑战应答。
+A direct SSH session first receives a Broker `challenge`. Writing `{}` to the SSH pipeline closes standard input, and the Broker responds with `Expected authenticate message`. This confirms that SSH, the public key, and the Broker path are connected while the input remains outside the complete HMAC protocol. The production client keeps standard input open and completes the challenge-response.
 
-### 客户端显示 `Transport closed before authentication challenge`
+### The client reports `Transport closed before authentication challenge`
 
-新版客户端会把 SSH 标准错误写入 `-LogPath`。常见检查顺序：
+The current client writes SSH standard error to `-LogPath`. Start with:
 
 ```powershell
 Test-NetConnection '<B_ADDRESS>' -Port 2222
 Get-Content "$HOME\ps-tunnel-client.log" -Tail 100
 ```
 
-然后使用详细 SSH 日志确认连接、公钥和 host key：
+Then use verbose SSH logging to inspect the connection, public key, and host key:
 
 ```powershell
 ssh.exe -vvv -T -p 2222 `
@@ -414,41 +420,41 @@ ssh.exe -vvv -T -p 2222 `
     '<B_ADDRESS>'
 ```
 
-成功链路会依次出现 `Connection established`、host key 匹配、`Offering public key`、`Authenticated` 和 JSON challenge。按 Ctrl+C 结束手工诊断。
+A successful path shows `Connection established`, a matching host key, `Offering public key`, `Authenticated`, and the JSON challenge. Press Ctrl+C to end the manual diagnostic session.
 
-### PowerShell 5.1 的 UTF-8 BOM
+### UTF-8 BOM in Windows PowerShell 5.1
 
-Windows PowerShell 5.1 的 `Set-Content -Encoding UTF8` 会写入 BOM。配置生成示例使用 `.NET UTF8Encoding(false)` 写入；服务端读取配置时也会兼容 BOM。
+`Set-Content -Encoding UTF8` in Windows PowerShell 5.1 writes a BOM. The configuration example uses `.NET UTF8Encoding(false)`, and the server also accepts configuration files with a BOM.
 
-由 PowerShell 7 启动 Windows PowerShell 5.1 时，继承的 `PSModulePath` 可能影响内置模块自动加载。一键脚本生成直接调用 Windows DPAPI 的 .NET API，因此不依赖 `Microsoft.PowerShell.Security` 模块。
+When PowerShell 7 starts Windows PowerShell 5.1, the inherited `PSModulePath` can affect built-in module auto-loading. The one-click launcher calls the Windows DPAPI .NET API directly and therefore has no dependency on the `Microsoft.PowerShell.Security` module.
 
-### 路径中包含空格
+### Paths contain spaces
 
-客户端和 `start.ps1` 都会为原生命令正确引用参数。固定部署到简短目录仍更便于人工排障，例如 `C:\ps_tunnel`。
+The client and `start.ps1` quote arguments for native commands. A short fixed path such as `C:\ps_tunnel` remains convenient for manual diagnostics.
 
-### 端口已被占用
+### A port is already in use
 
 ```powershell
 Get-NetTCPConnection -State Listen -LocalPort 2222,8765,8766 |
     Select-Object LocalAddress,LocalPort,OwningProcess
 ```
 
-`start.ps1` 会校验监听端口的进程命令行，避免把未知监听器误认为 PS Tunnel。
+`start.ps1` validates the command line of the process that owns each listening port so an unrelated listener is not mistaken for PS Tunnel.
 
-## 扩展任务动作
+## Extend task actions
 
-增加一个动作时，需要同步更新：
+Adding an action requires coordinated updates:
 
-1. `client/client.ps1` 中的 `$AllowedTaskScript`。
-2. `server/broker.js` 中的 `ALLOWED_ACTIONS`。
-3. `server/ctl.ps1` 中 `TaskAction` 的 `ValidateSet`。
-4. `server/e2e.ps1` 中相应的正常、异常和超时测试。
+1. Update `$AllowedTaskScript` in `client/client.ps1`.
+2. Update `ALLOWED_ACTIONS` in `server/broker.js`.
+3. Update the `TaskAction` `ValidateSet` in `server/ctl.ps1`.
+4. Add success, failure, and timeout coverage in `server/e2e.ps1`.
 
-`powershell` 动作可直接承载任意 PowerShell 脚本。新增专用动作时，应使用结构化参数和结构化结果，并设置输入长度、执行时间和输出大小上限。
+The `powershell` action already carries arbitrary PowerShell scripts. A dedicated action should use structured parameters and results, with explicit limits for input length, execution time, and output size.
 
-## 测试
+## Tests
 
-测试需要完整依赖。在仓库根目录执行：
+Tests require the complete dependency set. From the repository root:
 
 ```powershell
 Set-Location .\server
@@ -459,29 +465,31 @@ pwsh -NoProfile -File .\server\e2e.ps1 `
     -ClientPowerShellPath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
 ```
 
-以上测试会通过官方 MCP client SDK 完成 `initialize`、`tools/list` 和四个 tools 的调用，并启动两个独立 MCP stdio 实例并发执行两条 7 秒 PowerShell 任务。测试同时验证任务运行期间心跳、超时 worker 终止、后续任务恢复和 session 连续性。加入 `-CodexMcp` 会再启动本机 Codex 临时会话，让模型实际调用 `list_agents` 和 `run_powershell`，并在 Broker 状态与模型最终回复中核对唯一 marker：
+This test uses the official MCP client SDK to complete `initialize`, `tools/list`, and calls to all four tools. It also starts two independent stdio MCP instances that concurrently execute two seven-second PowerShell tasks. The suite verifies heartbeats during task execution, timeout termination, recovery for subsequent tasks, session continuity, and strict JSON output for non-finite PowerShell numbers.
+
+Add `-CodexMcp` to start an ephemeral local Codex session, make the model call `list_agents` and `run_powershell`, and verify a unique marker in both Broker state and the model's final response:
 
 ```powershell
 pwsh -NoProfile -File .\server\e2e.ps1 -CodexMcp
 ```
 
-E2E 会在 `%TEMP%/ps-tunnel-e2e-*` 下创建独立的 Broker 状态、MCP 工作区和 Codex 工作区。Codex 使用 `--ephemeral` 与一次性 `-c` 配置，测试成功后自动删除整个临时目录，当前仓库的 Codex resume 状态保持独立。
+E2E creates isolated Broker state, MCP workspace, and Codex workspace under `%TEMP%/ps-tunnel-e2e-*`. Codex uses `--ephemeral` and one-time `-c` settings. A successful test removes the entire temporary directory and keeps the current repository's Codex resume state independent.
 
-自动启动专项测试会先确认临时端口为空，再由 MCP 启动临时 Broker 和 SSH server。加入 `-CodexMcp` 后，测试会停止 SDK 阶段启动的服务，创建独立 `CODEX_HOME` 和工作目录，再由真实 Codex 模型启动 MCP、等待 Agent 回连并调用 `run_powershell`：
+The auto-start test first verifies that its temporary ports are free, then lets MCP start a temporary Broker and SSH server. With `-CodexMcp`, it stops the services used by the SDK phase, creates an isolated `CODEX_HOME` and working directory, and then lets a real Codex model start MCP, wait for the Agent to reconnect, and call `run_powershell`:
 
 ```powershell
 pwsh -NoProfile -File .\server\mcp-autostart-e2e.ps1 -CodexMcp
 ```
 
-专项测试的配置、状态、SSH 密钥、日志、MCP 工作区和 Codex 状态都位于 `%TEMP%/ps-tunnel-mcp-autostart-*`，成功后整体删除；当前仓库和现有 Codex resume 状态只参与只读加载。
+Its configuration, state, SSH keys, logs, MCP workspace, and Codex state live under `%TEMP%/ps-tunnel-mcp-autostart-*` and are removed together after success. The current repository and existing Codex resume state are loaded read-only.
 
-完整测试覆盖 HMAC 认证、DPAPI 启动脚本生成与实际执行、Secret 检查、任意 PowerShell、并行 worker、双 MCP 实例、Codex 模型调用、任务超时恢复、`echo`、主机信息、强制断线、自动重连和重连后任务。生产部署还应从 A 执行一次 `Test-NetConnection` 和详细 SSH 握手检查。
+The complete suite covers HMAC authentication, DPAPI launcher generation and execution, secret checks, arbitrary PowerShell, parallel workers, dual MCP instances, Codex model calls, timeout recovery, `echo`, host information, forced disconnect, automatic reconnect, and post-reconnect tasks. Production deployment should also include one `Test-NetConnection` and verbose SSH handshake from A.
 
-## 密钥轮换
+## Key rotation
 
-- 轮换 Agent SSH key：在 B 更新 `authorizedKeyFile` 指向的公钥，在 A 更新对应私钥。
-- 轮换 Agent Secret：在 B 更新 `agents.<agent-id>`，随后更新 A 的环境变量并重启客户端。
-- 轮换控制令牌：在 B 更新 `controlToken`，随后更新运行 `ctl.ps1` 的环境变量。
-- 轮换 B host key：先通过可信渠道分发新指纹和 `known_hosts`，再重启 SSH 监听器。
+- Rotate an Agent SSH key by updating the public key referenced by `authorizedKeyFile` on B and the matching private key on A.
+- Rotate an Agent Secret by updating `agents.<agent-id>` on B, then updating A's environment variable and restarting the client.
+- Rotate the control token by updating `controlToken` on B, then updating the environment of every process that runs `ctl.ps1`.
+- Rotate B's host key by distributing the new fingerprint and `known_hosts` entry through a trusted channel before restarting the SSH listener.
 
-每台 A 建议使用独立 Agent ID、SSH key 和 Agent Secret，以便单独撤销和审计。
+Use a separate Agent ID, SSH key, and Agent Secret for each A endpoint so each device can be revoked and managed independently.
